@@ -1,0 +1,31 @@
+# Ignore all binaries by default to prevent accidental uploads from build folders
+build/
+.pio/
+.pioenvs/
+.piolibdeps/
+*.bin
+
+# Allow binaries located specifically in the /bin folder
+!bin/*.bin
+
+# Ignore large and unnecessary build artifacts
+*.elf
+*.hex
+
+# Temporary and cache files
+*.tmp
+*.bak
+*.swp
+*~
+.cache/
+
+# VS Code settings (if used)
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# OS specific files
+.DS_Store
+Thumbs.db
