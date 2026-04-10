@@ -2,7 +2,7 @@
  * Custom Firmware for NOUS A5T (ESP8266 / ESP8285)
  * Based on Tasmota template: {"NAME":"NOUS A5T","GPIO":[0,3072,544,3104,0,259,0,0,225,226,224,0,35,4704],"FLAG":1,"BASE":18}
  */
-#define FW_VERSION "2.7.0-EN"
+#define FW_VERSION "2.7.1-EN"
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -13,6 +13,7 @@
 #include <PubSubClient.h>
 #include <LittleFS.h>
 #include <SoftwareSerial.h>
+#include <stdlib.h>
 
 // ================= PINS =================
 const int RELAY_PINS[] = {14, 12, 13, 5}; // R1, R2, R3, R4(USB)
@@ -23,18 +24,26 @@ const int LED_PIN = 2;  // GPIO2 (LED Link)
 
 // ================= CONSTANTS =================
 // Factory Default values for calibration
-#define DEFAULT_CAL_V 2.365000f
-#define DEFAULT_CAL_I 1.025885f
-#define DEFAULT_CAL_P 2.514068f
+#define DEFAULT_CAL_V 2.380000f
+#define DEFAULT_CAL_I 0.930000f
+#define DEFAULT_CAL_P 2.510000f
 
 // Time Intervals (ms)
-#define MQTT_PUB_INTERVAL 5000
+#define MQTT_PUB_INTERVAL 1000
 #define MQTT_RECONNECT_INTERVAL 15000
 #define CAL_STABILIZE_DELAY 1000
 #define CAL_TOTAL_DURATION 15000
 #define CFG_SAVE_DELAY 5000
 #define CSE_RETRY_INTERVAL 3000
-#define MAX_POWER_LIMIT 3680.0f // 16A Limit at 230V
+#define LOW_POWER_THRESHOLD 15.0f // Power threshold (W) below which 15s average is applied
+#define LONG_AVG_INTERVAL 15000   // Long averaging interval (15 seconds in ms)
+#define P_NOISE_MIN          0.30f     // below 0.3W = noise
+#define I_NOISE_MIN          0.03f     // below 30mA = noise
+#define P_DEADBAND           0.4f      // below 0.4 W -> consider 0
+#define P_OFFSET             4.6f      // determined offset for internal consumption
+#define EMA_ALPHA            0.10f     // Global Smoothing Factor (EMA)
+#define MAX_P_SAMPLES        2500      // Support for 300s (5 min) with safety margin
+#define MAX_POWER_LIMIT 3680.0f // 16A limit at 230V
 #define CONFIG_MAGIC 0xA5A50005 // Configuration version
 
 // ADC Button Thresholds
@@ -60,6 +69,7 @@ struct MqttConfig {
   char topic[32];
   bool enabled;
   char mdns_hostname[32];
+  uint16_t pub_interval; // Reporting interval in seconds
 };
 
 struct AppConfig {
@@ -72,10 +82,10 @@ struct AppConfig {
   uint8_t power_on_behavior; // 0: OFF, 1: ON, 2: PREVIOUS
   
   // Security Settings
-  bool auth_config;    // Auth for configuration pages
+  bool auth_config;    // Auth for config pages
   char user_config[16];
   char pass_config[16];
-  bool auth_root;      // Auth for main page (Status)
+  bool auth_root;      // Auth for status page
   char user_root[16];
   char pass_root[16];
   char ota_pass[32];   // OTA Password
@@ -98,27 +108,55 @@ SoftwareSerial cseSerial(3, 1); // RX=GPIO3, TX=GPIO1 (Configuration confirmed f
 // ================= STATE =================
 bool setupMode = false;
 unsigned long wifiConnectCount = 0;
+unsigned long wifiDisconnectCount = 0;
 unsigned long mqttConnectCount = 0;
+unsigned long mqttDisconnectCount = 0;
 WiFiEventHandler wifiConnectHandler;
+WiFiEventHandler wifiDisconnectHandler;
 bool configDirty = false;
 unsigned long lastChangeTime = 0;
+bool lastMqttConnectedState = false;
 
 // CSE7766 Vars
 double cse_voltage = 0.0;
 double cse_current = 0.0;
 double cse_power = 0.0;
 double cse_pf = 0.0;
+double ema_power = 0.0;
+
+// Raw values from CSE7766 (instantaneous, uncalibrated)
+double cse_raw_v = 0.0;
+double cse_raw_i = 0.0;
+double cse_raw_p = 0.0;
+
+// Accumulators for 1-second average (used by mqttPublishEnergy to get a stable 1s value)
+double raw_v_sum_1s = 0.0;
+double raw_i_sum_1s = 0.0;
+double raw_p_sum_1s = 0.0;
+int raw_count_1s = 0;
+
 uint8_t cse_buff[32];
 int cse_idx = 0;
-unsigned long lastCsePacketTime = 0; // Time of the last valid packet (for retry)
+unsigned long lastCsePacketTime = 0; // Last valid packet time (for retry)
 
-// State Calibrare
+// Accumulators for MQTT reporting (average over set interval)
+double mqtt_raw_v_sum = 0.0;
+double mqtt_raw_i_sum = 0.0;
+double mqtt_raw_p_sum = 0.0;
+int mqtt_raw_count = 0;
+unsigned long last_mqtt_report_time = 0; // Timestamp of the last MQTT publication
+
+// Buffer for advanced filtering (Median + Trimmed Mean)
+float pBuffer[MAX_P_SAMPLES];
+int pCount = 0;
+
+// Calibration State
 bool isCalibrating = false;
 unsigned long calStartTime = 0;
 float calTargetP = 0;
 double sumRawV = 0, sumRawI = 0, sumRawP = 0;
 int calSamples = 0;
-String calStatusMsg = "System Ready";
+String calStatusMsg = "System ready";
 
 // Forward declarations
 void mqttPublishState(int relayIdx);
@@ -128,6 +166,7 @@ void sendDiscoveryMessages();
 void startNormalServices();
 void pageSecurity();
 void handleSaveSecurity();
+void handleSaveInterval();
 
 // Auth helper
 bool checkAuth(bool required, const char* user, const char* pass) {
@@ -139,10 +178,70 @@ bool checkAuth(bool required, const char* user, const char* pass) {
   return true;
 }
 
-// Register pages and services for normal mode
+// ================= FILTERING HELPERS (LOW POWER STABILITY) =================
+// Comparison function for qsort
+int compareFloats(const void* a, const void* b) {
+    float fa = *(const float*)a;
+    float fb = *(const float*)b;
+    if (fa < fb) return -1;
+    if (fa > fb) return 1;
+    return 0;
+}
+
+float getMedian(float *arr, int n) {
+    if (n <= 0) return 0.0f;
+    float* temp = (float*)malloc(n * sizeof(float));
+    if (!temp) return 0.0f; // Fail safe if RAM is critical
+
+    memcpy(temp, arr, n * sizeof(float));
+    qsort(temp, n, sizeof(float), compareFloats);
+    float result = (n % 2 == 1) ? temp[n/2] : (temp[n/2 - 1] + temp[n/2]) * 0.5f;
+    free(temp);
+    return result;
+}
+
+float getTrimmedMean(float *arr, int n) {
+    if (n < 5) return getMedian(arr, n);
+    float* temp = (float*)malloc(n * sizeof(float));
+    if (!temp) return getMedian(arr, n);
+
+    memcpy(temp, arr, n * sizeof(float));
+    qsort(temp, n, sizeof(float), compareFloats);
+    int cut = n * 0.2f; // Remove 20% of extreme values
+    if (cut < 1) cut = 1;
+    float sum = 0;
+    int count = 0;
+    for (int i = cut; i < n - cut; i++) {
+        sum += temp[i];
+        count++;
+    }
+    float result = (count > 0) ? (sum / count) : 0.0f;
+    free(temp);
+    return (result > 0) ? result : getMedian(arr, n);
+}
+
+void ingestPowerSample(double RawP, double P, double I) {
+    // Spike prevention
+    if (RawP > 5000.0 || P > 10000.0) return;
+
+    float val = (float)P - P_OFFSET;
+    if (val < 0.0f) val = 0.0f;
+    if (val < P_DEADBAND) val = 0.0f;
+    if (I < I_NOISE_MIN) val = 0.0f;
+
+    // EMA Filter (Exponential Moving Average)
+    ema_power = ema_power + (double)EMA_ALPHA * ((double)val - ema_power);
+
+    if (P < LOW_POWER_THRESHOLD && pCount < MAX_P_SAMPLES) {
+        pBuffer[pCount] = (float)ema_power;
+        pCount++;
+    }
+}
+
+// Page and service registration for normal mode
 void startNormalServices() {
     MDNS.begin(mqttCfg.mdns_hostname);
-    ArduinoOTA.setHostname(mqttCfg.mdns_hostname);
+    ArduinoOTA.setHostname("NOUS A5T");
     ArduinoOTA.setPassword(appCfg.ota_pass);
     ArduinoOTA.begin();
     MDNS.addService("http", "tcp", 80);
@@ -163,6 +262,7 @@ void startNormalServices() {
     server.on("/save_connection", handleSaveConnection);
     server.on("/save_mdns", handleSaveMdns);
     server.on("/save_topic", handleSaveTopic);
+    server.on("/save_interval", handleSaveInterval);
     server.on("/save_mqtt_control", handleSaveMqttControl);
     server.on("/force_discovery", handleForceDiscovery);
     server.on("/do_calibrate", handleDoCalibrate);
@@ -209,7 +309,7 @@ void saveAppConfig() {
     size_t written = f.write((uint8_t*)&appCfg, sizeof(AppConfig));
     f.close();
     if (written == sizeof(AppConfig)) {
-      // Atomic operation: delete old config only if the new one is fully written
+      // Atomic operation: delete old config only if new is written completely
       LittleFS.remove("/app.bin");
       LittleFS.rename("/app.bin.tmp", "/app.bin");
     }
@@ -247,8 +347,11 @@ void loadConfig() {
     strlcpy(mqttCfg.topic, "nous", sizeof(mqttCfg.topic));
     mqttCfg.enabled = false;
     strlcpy(mqttCfg.mdns_hostname, "NOUS-A5T", sizeof(mqttCfg.mdns_hostname));
+    mqttCfg.pub_interval = 1;
   }
   if (strlen(mqttCfg.mdns_hostname) == 0) strlcpy(mqttCfg.mdns_hostname, "NOUS-A5T", sizeof(mqttCfg.mdns_hostname));
+  if (mqttCfg.pub_interval < 1) mqttCfg.pub_interval = 1;
+  if (mqttCfg.pub_interval > 300) mqttCfg.pub_interval = 300; // Capped at 5 minutes
 
   // App
   if (LittleFS.exists("/app.bin")) {
@@ -261,15 +364,15 @@ void loadConfig() {
     appCfg.child_lock = false;
     appCfg.power_on_behavior = 2; // Default: Previous
 
-    // DEFAULT CALIBRATION VALUES PER REQUIREMENT
+    // DEFAULT CALIBRATION VALUES
     appCfg.cal_voltage = DEFAULT_CAL_V; 
     appCfg.cal_current = DEFAULT_CAL_I; 
     appCfg.cal_power = DEFAULT_CAL_P;   
   }
   
-  // Validare factori calibrare
+  // Validate configuration
   if (appCfg.magic != CONFIG_MAGIC) {
-    // If the data structure has changed, reset factors to safe values
+    // If structure changed, reset to safe values
     appCfg.magic = CONFIG_MAGIC;
     appCfg.cal_voltage = DEFAULT_CAL_V;
     appCfg.cal_current = DEFAULT_CAL_I;
@@ -314,7 +417,7 @@ void setRelay(int relayIdx, bool state) {
 }
 
 void toggleAll() {
-  // Logic: If at least one is OFF -> All ON. If all are ON -> All OFF.
+  // Logic: If any is OFF -> All ON. If all are ON -> All OFF.
   bool anyOff = false;
   for (int i = 0; i < RELAY_COUNT; i++) {
     if (!appCfg.relay_state[i]) {
@@ -323,7 +426,7 @@ void toggleAll() {
     }
   }
 
-  bool newState = anyOff; // true (ON) if we find one turned off
+  bool newState = anyOff; // true (ON) if we found one turned off
   for (int i = 0; i < RELAY_COUNT; i++) {
     setRelay(i, newState);
   }
@@ -364,21 +467,120 @@ void mqttPublishState(int relayIdx) {
 }
 
 void mqttPublishEnergy() {
-  if (mqtt.connected()) {
-    char topic[64];
-    char val[16];
-    
-    snprintf(topic, sizeof(topic), "%s/voltage", mqttCfg.topic);
-    dtostrf(cse_voltage, 1, 1, val); mqtt.publish(topic, val);
-    
-    snprintf(topic, sizeof(topic), "%s/current", mqttCfg.topic);
-    dtostrf(cse_current, 1, 3, val); mqtt.publish(topic, val);
-    
-    snprintf(topic, sizeof(topic), "%s/power", mqttCfg.topic);
-    dtostrf(cse_power, 1, 1, val); mqtt.publish(topic, val);
-    
-    snprintf(topic, sizeof(topic), "%s/pf", mqttCfg.topic);
-    dtostrf(cse_pf, 1, 2, val); mqtt.publish(topic, val);
+  // Capture raw sums and counts from the last second
+  double temp_raw_v_sum_1s = raw_v_sum_1s;
+  double temp_raw_i_sum_1s = raw_i_sum_1s;
+  double temp_raw_p_sum_1s = raw_p_sum_1s;
+  int temp_raw_count_1s = raw_count_1s;
+
+  // Reset 1s accumulators
+  raw_v_sum_1s = 0; raw_i_sum_1s = 0; raw_p_sum_1s = 0; raw_count_1s = 0;
+
+  // Calculate 1s average
+  double avg_v_1s = 0.0, avg_i_1s = 0.0, avg_p_1s = 0.0;
+  if (temp_raw_count_1s > 0) {
+    avg_v_1s = temp_raw_v_sum_1s / temp_raw_count_1s;
+    avg_i_1s = temp_raw_i_sum_1s / temp_raw_count_1s;
+    avg_p_1s = temp_raw_p_sum_1s / temp_raw_count_1s;
+    // Update decision variables
+    cse_voltage = avg_v_1s * appCfg.cal_voltage;
+    cse_current = avg_i_1s * appCfg.cal_current;
+    cse_power   = avg_p_1s * appCfg.cal_power;
+  }
+
+  // Calculate calibrated 1s power to decide reporting mode
+  double calculated_p_1s = avg_p_1s * appCfg.cal_power;
+  
+  // Apply offset/deadband for low power reporting decision
+  if (calculated_p_1s < LOW_POWER_THRESHOLD) {
+      calculated_p_1s -= P_OFFSET;
+      if (calculated_p_1s < P_DEADBAND) calculated_p_1s = 0.0;
+  }
+
+  // If power is low, wait for enough samples before reporting
+  if (calculated_p_1s < LOW_POWER_THRESHOLD && pCount < MAX_P_SAMPLES) return;
+
+  // 1. Accumulate raw data into MQTT collector
+  mqtt_raw_v_sum += temp_raw_v_sum_1s;
+  mqtt_raw_i_sum += temp_raw_i_sum_1s;
+  mqtt_raw_p_sum += temp_raw_p_sum_1s;
+  mqtt_raw_count += temp_raw_count_1s;
+
+  // Calculate target reporting interval
+  unsigned long interval_ms = (unsigned long)mqttCfg.pub_interval * 1000;
+  if (calculated_p_1s < LOW_POWER_THRESHOLD) {
+    // If power is below 15W, reporting time is AT LEAST 15s.
+    if (interval_ms < 15000) interval_ms = 15000;
+  }
+
+  // 2. Check if reporting time has passed
+  if (millis() - last_mqtt_report_time >= interval_ms) {
+    // Calculate raw averages
+    double avg_v = mqtt_raw_v_sum / mqtt_raw_count;
+    double avg_i = mqtt_raw_i_sum / mqtt_raw_count;
+    double avg_p = mqtt_raw_p_sum / mqtt_raw_count;
+
+    double pub_power = 0;
+    if (calculated_p_1s < LOW_POWER_THRESHOLD) {
+      // Low power: Apply Median + Trimmed Mean algorithm on sample buffer
+      pub_power = (double)(getMedian(pBuffer, pCount) + getTrimmedMean(pBuffer, pCount)) * 0.5;
+    } else {
+      // High power: Arithmetic mean over interval
+      pub_power = avg_p * appCfg.cal_power;
+    }
+
+    // Reset MQTT session accumulators and low power buffer
+    mqtt_raw_v_sum = 0; mqtt_raw_i_sum = 0; mqtt_raw_p_sum = 0; mqtt_raw_count = 0;
+    pCount = 0; 
+    last_mqtt_report_time = millis();
+
+    // Apply calibration factors to calculated MEAN
+    double pub_voltage = avg_v * appCfg.cal_voltage;
+    double pub_current = avg_i * appCfg.cal_current;
+    double pub_pf      = 0.0;
+
+    // Apply noise filters (noise floor & suppression)
+    if (pub_current < 0.05f) pub_current *= 0.25f;
+    if (pub_power < 3.0f && calculated_p_1s >= LOW_POWER_THRESHOLD) pub_power *= 0.40f; 
+
+    // Power Factor (PF) calculation based on averages
+    double apparent = pub_voltage * pub_current;
+    if (apparent > 0.5) {
+      pub_pf = pub_power / apparent;
+      if (pub_pf > 1.0) pub_pf = 1.0;
+      else if (pub_pf < 0.0) pub_pf = 0.0;
+    } else {
+      pub_pf = 1.0;
+    }
+
+    // Final noise threshold for negligible values
+    if (pub_power < 0.1) {
+      pub_power = 0.0; pub_current = 0.0; pub_pf = 0.0;
+    }
+
+    // Publish average results to MQTT
+    if (mqtt.connected()) {
+      char topic[64];
+      char val[16];
+      
+      snprintf(topic, sizeof(topic), "%s/voltage", mqttCfg.topic);
+      dtostrf(pub_voltage, 1, 1, val); mqtt.publish(topic, val);
+      
+      snprintf(topic, sizeof(topic), "%s/current", mqttCfg.topic);
+      dtostrf(pub_current, 1, 3, val); mqtt.publish(topic, val);
+      
+      snprintf(topic, sizeof(topic), "%s/power", mqttCfg.topic);
+      dtostrf(pub_power, 1, 1, val); mqtt.publish(topic, val);
+      
+      snprintf(topic, sizeof(topic), "%s/pf", mqttCfg.topic);
+      dtostrf(pub_pf, 1, 2, val); mqtt.publish(topic, val);
+
+      // Send average raw data for debugging
+      char rawBuf[128];
+      snprintf(topic, sizeof(topic), "%s/raw", mqttCfg.topic);
+      snprintf(rawBuf, sizeof(rawBuf), "AvgV: %.2f | AvgI: %.4f | AvgP: %.2f (Interval: %lus)", avg_v, avg_i, avg_p, interval_ms/1000);
+      mqtt.publish(topic, rawBuf);
+    }
   }
 }
 
@@ -453,7 +655,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 void sendDiscoveryMessages() {
   if (!mqtt.connected()) return;
 
-  // Get the MAC once as a fixed string
+  // Obtain MAC address once as a fixed string
   char mac[13];
   uint8_t m[6];
   WiFi.macAddress(m);
@@ -465,7 +667,7 @@ void sendDiscoveryMessages() {
   topic.reserve(128);
   payload.reserve(768);
 
-  // Helper to add Device Info fragment (saves RAM via direct writing)
+  // Helper to add the Device Info fragment (saves RAM)
   auto appendDeviceConfig = [&]() {
     payload += F(",\"dev\":{\"ids\":[\"");
     payload += mac;
@@ -549,6 +751,17 @@ void sendDiscoveryMessages() {
     payload += F("}");
     mqtt.publish(topic.c_str(), payload.c_str(), true);
   }
+
+  // 6. Raw Data Sensor
+  {
+    topic = F("homeassistant/sensor/"); topic += mac; topic += F("/raw/config");
+    payload = F("{\"name\":\"Raw Data\",\"uniq_id\":\""); payload += mac;
+    payload += F("_raw\",\"stat_t\":\""); payload += mqttCfg.topic;
+    payload += F("/raw\",\"icon\":\"mdi:code-braces\"");
+    appendDeviceConfig();
+    payload += F("}");
+    mqtt.publish(topic.c_str(), payload.c_str(), true);
+  }
 }
 
 void mqttConnect() {
@@ -571,7 +784,7 @@ void mqttConnect() {
   if (connected) {
     mqttConnectCount++;
     char subTopic[64];
-    // Subscribe to individual topics: base/relay/0/set
+    // Subscribe to individual topics
     for(int i=0; i<RELAY_COUNT; i++) {
       snprintf(subTopic, sizeof(subTopic), "%s/relay/%d/set", mqttCfg.topic, i);
       mqtt.subscribe(subTopic);
@@ -591,17 +804,17 @@ void mqttConnect() {
 void handleCSE7766() {
   static unsigned long lastByteMs = 0;
   if (cse_idx > 0 && millis() - lastByteMs > 50) {
-    cse_idx = 0; // Reset buffer on inter-char timeout to prevent corruption
+    cse_idx = 0; // Reset buffer on inter-char timeout
   }
 
   while (cseSerial.available() > 0) {
     uint8_t c = cseSerial.read();
     lastByteMs = millis();
     
-    // Header Synchronization 0x55 (Byte 0) and 0x5A (Byte 1)
+    // Header synchronization
     if (cse_idx == 0 && c != 0x55) continue;
     if (cse_idx == 1 && c != 0x5A) { 
-      // If we receive 55 instead of 5A, it might be a new packet start
+      // If 0x55 is received instead of 0x5A, it might be a new packet start
       if (c == 0x55) cse_idx = 1; 
       else cse_idx = 0; 
       continue; 
@@ -614,9 +827,9 @@ void handleCSE7766() {
     }
     
     if (cse_idx >= 24) {
-      // Checksum Verification
+      // Checksum verification
       uint8_t sum = 0;
-      for (int i = 2; i < 23; i++) sum += cse_buff[i]; // Correction: Sum starts from byte 2 (excluding header)
+      for (int i = 2; i < 23; i++) sum += cse_buff[i]; // Correction: Sum starts from byte 2
       
       if (sum == cse_buff[23]) {
         unsigned long v_coeff = ((unsigned long)cse_buff[2] << 16) | ((unsigned long)cse_buff[3] << 8) | cse_buff[4];
@@ -627,13 +840,42 @@ void handleCSE7766() {
         unsigned long p_cycle = ((unsigned long)cse_buff[17] << 16) | ((unsigned long)cse_buff[18] << 8) | cse_buff[19];
         uint8_t adj = cse_buff[20];
 
-        if ((adj & 0x40) && v_cycle > 0) cse_voltage = ((double)v_coeff / v_cycle) * appCfg.cal_voltage; else cse_voltage = 0;
-        if ((adj & 0x20) && i_cycle > 0) cse_current = ((double)i_coeff / i_cycle) * appCfg.cal_current; else cse_current = 0;
-        if ((adj & 0x10) && p_cycle > 0) cse_power = ((double)p_coeff / p_cycle) * appCfg.cal_power; else cse_power = 0;
+        // Calculate instantaneous RAW values
+        double t_raw_v = (v_cycle > 0) ? (double)v_coeff / v_cycle : 0.0;
+        double t_raw_i = (i_cycle > 0) ? (double)i_coeff / i_cycle : 0.0;
+        double t_raw_p = (p_cycle > 0) ? (double)p_coeff / p_cycle : 0.0;
+        double t_power = t_raw_p * appCfg.cal_power;
+
+        // ERROR FILTER: Ignore impossible readings
+        if (t_raw_p > 5000.0 || t_power > 10000.0) {
+          cse_idx = 0;
+          return;
+        }
+
+        cse_raw_v = t_raw_v;
+        cse_raw_i = t_raw_i;
+        cse_raw_p = t_raw_p;
+        cse_power = t_power;
+
+        // Accumulate valid raw data for 1s average
+        raw_v_sum_1s += t_raw_v;
+        raw_i_sum_1s += t_raw_i;
+        raw_p_sum_1s += t_raw_p;
+        raw_count_1s++;
+
+        cse_voltage = t_raw_v * appCfg.cal_voltage;
+        cse_current = t_raw_i * appCfg.cal_current;
+        
+        // Ingest sample into buffer
+        ingestPowerSample(t_raw_p, t_power, cse_current);
+        
+        // Instant filter for UI (User Interface)
+        cse_power = ema_power;
+
+        if (cse_current < 0.05f) cse_current *= 0.25f;
         
         // Noise correction and Power Factor calculation
         if (cse_power < 0.1) { 
-          // If active power is below 0.1W, consider zero consumption (noise removal)
           cse_power = 0.0;
           cse_current = 0.0;
           cse_pf = 0.0;
@@ -644,11 +886,11 @@ void handleCSE7766() {
             if (cse_pf > 1.0) cse_pf = 1.0;
             else if (cse_pf < 0.0) cse_pf = 0.0;
           } else {
-            cse_pf = 1.0; // Small pure resistive load or undeterminable
+            cse_pf = 1.0; // Small resistive load or undeterminable
           }
         }
         
-        // Accumulation for calibration after 1s stabilization (total 15s, 14s sampling)
+        // Accumulate for calibration after 1s stabilization
         if (isCalibrating && (millis() - calStartTime > CAL_STABILIZE_DELAY) && v_cycle > 0 && i_cycle > 0 && p_cycle > 0) {
           sumRawV += (double)v_coeff / v_cycle;
           sumRawI += (double)i_coeff / i_cycle;
@@ -658,10 +900,10 @@ void handleCSE7766() {
 
         lastCsePacketTime = millis();
 
-        // Hardware Overload Protection (Immediate reaction on reading)
-        if (cse_power > MAX_POWER_LIMIT) {
+        // Hardware Over-Power Protection
+        if (t_power > MAX_POWER_LIMIT) {
           for(int i=0; i<RELAY_COUNT; i++) setRelay(i, false);
-          calStatusMsg = F("AVARIE: LIMITA PUTERE DEPASITA!");
+          calStatusMsg = F("ALARM: POWER LIMIT EXCEEDED!");
           mqttPublishAll();
         }
       }
@@ -706,10 +948,10 @@ void pageStatus() {
   content += FW_VERSION;
   content += F(")</h2>");
   
-  // Flex Container for buttons (4 columns)
+  // Flex container for buttons
   content += F("<div style='display:flex; flex-wrap:wrap; gap:10px; margin-bottom:20px;'>");
   for(int i=0; i<RELAY_COUNT; i++) {
-    String name = (i == 3) ? "USB" : ("P" + String(i+1));
+    String name = (i == 3) ? "USB" : ("Socket " + String(i+1));
     String btnColor = appCfg.relay_state[i] ? "" : "off";
     String btnText = appCfg.relay_state[i] ? "ON" : "OFF";
     
@@ -726,8 +968,8 @@ void pageStatus() {
     content += F("</a></div>");
   }
 
-  // Child Lock Button (Column 5)
-  String clBtnColor = appCfg.child_lock ? "" : "off"; // ON = Activ (Verde/Standard), OFF = Inactiv (Gri)
+  // Child Lock button
+  String clBtnColor = appCfg.child_lock ? "" : "off"; // ON = Active, OFF = Inactive
   content += F("<div style='flex:1 1 0px; background:#fff; padding:10px; border:1px solid #ddd; border-radius:5px; text-align:center;'>");
   content += "<b>Child Lock</b><br>";
   content += F("<a href='/toggle_child_lock' id='btnCL' class='btn ");
@@ -753,25 +995,26 @@ void pageStatus() {
 
   content += F("<div class='row'>");
 
-  // 1. Consum
-  content += F("<div class='col'><fieldset><legend>Consumption</legend>");
+  // 1. Consumption
+  content += F("<div class='col'><fieldset><legend>Instant Consumption (Unfiltered)</legend>");
   content += F("<b>Voltage:</b> <span id='volt'>"); content += cse_voltage; content += F("</span> V<br>");
   content += F("<b>Current:</b> <span id='curr'>"); content += cse_current; content += F("</span> A<br>");
   content += F("<b>Power:</b> <span id='pwr'>"); content += cse_power; content += F("</span> W<br>");
   content += F("<b>Power Factor:</b> <span id='pf'>"); content += String(cse_pf, 2); content += F("</span><br>");
   content += F("</fieldset></div>");
 
-  // 2. WiFi Info
+  // 2. WiFi
   content += F("<div class='col'><fieldset><legend>System & WiFi</legend>");
   content += F("<b>Status:</b> "); 
   content += (WiFi.status() == WL_CONNECTED ? F("<span style='color:green'>Connected</span>") : F("<span style='color:red'>Disconnected</span>"));
-  content += F("<br><div style='display:flex;align-items:center;gap:10px;margin-top:5px;'><b>Connections:</b> ");
-  content += wifiConnectCount;
-  content += "<form action='/reset_stats' method='POST' style='margin:0;'><input type='hidden' name='type' value='wifi'><button type='submit' class='secondary' style='width:auto;padding:2px 8px;font-size:12px;margin:0;'>Reset</button></form></div>";
+  content += F("<br><b>Connections:</b> <span id='wifiCon'>"); content += wifiConnectCount; content += F("</span>");
+  content += F("<br><div style='display:flex;align-items:center;gap:10px;margin-top:5px;'><b>Disconnects:</b> <span id='wifiDis'>");
+  content += wifiDisconnectCount;
+  content += F("</span><form action='/reset_stats' method='POST' style='margin:0;'><input type='hidden' name='type' value='wifi'><button type='submit' class='secondary' style='width:auto;padding:2px 8px;font-size:12px;margin:0;'>Reset</button></form></div>");
   content += F("<b>IP:</b> "); content += WiFi.localIP().toString();
   content += F("<br><b>Chip ID:</b> "); content += String(ESP.getChipId(), HEX);
   content += F("<br><b>Flash:</b> "); content += (ESP.getFlashChipRealSize() / 1024);
-  content += F(" KB<br><b>Free RAM:</b> "); content += String(ESP.getFreeHeap() / 1024.0, 1);
+  content += F(" KB<br><b>Free RAM:</b> <span id='freeRam'>"); content += String((float)(ESP.getFreeHeap() / 1024.0), 1);
   content += F(" KB<br>");
   content += "</fieldset></div>";
 
@@ -780,9 +1023,10 @@ void pageStatus() {
   content += "<fieldset><legend>MQTT</legend>";
   content += F("<b>Status:</b> ");
   content += (mqtt.connected() ? F("<span style='color:green'>Connected</span>") : F("<span style='color:red'>Disconnected</span>"));
-  content += F("<br><div style='display:flex;align-items:center;gap:10px;margin-top:5px;'><b>Connections:</b> ");
-  content += mqttConnectCount;
-  content += "<form action='/reset_stats' method='POST' style='margin:0;'><input type='hidden' name='type' value='mqtt'><button type='submit' class='secondary' style='width:auto;padding:2px 8px;font-size:12px;margin:0;'>Reset</button></form></div>";
+  content += F("<br><b>Connections:</b> <span id='mqttCon'>"); content += mqttConnectCount; content += F("</span>");
+  content += F("<br><div style='display:flex;align-items:center;gap:10px;margin-top:5px;'><b>Disconnects:</b> <span id='mqttDis'>");
+  content += mqttDisconnectCount;
+  content += F("</span><form action='/reset_stats' method='POST' style='margin:0;'><input type='hidden' name='type' value='mqtt'><button type='submit' class='secondary' style='width:auto;padding:2px 8px;font-size:12px;margin:0;'>Reset</button></form></div>");
   content += F("<b>Mode:</b> "); content += (mqttCfg.enabled ? F("Active") : F("Inactive"));
   content += "</fieldset></div>";
 
@@ -801,6 +1045,11 @@ void pageStatus() {
   content += F("var cl=document.getElementById('btnCL');");
   content += F("if(cl){var s=p[17]==='1';cl.innerText=s?'ON':'OFF';");
   content += F("if(s)cl.classList.remove('off');else cl.classList.add('off');}");
+  content += F("document.getElementById('freeRam').innerText=p[18];");
+  content += F("document.getElementById('wifiCon').innerText=p[19]; ");
+  content += F("document.getElementById('wifiDis').innerText=p[20]; ");
+  content += F("document.getElementById('mqttCon').innerText=p[21]; ");
+  content += F("document.getElementById('mqttDis').innerText=p[22]; ");
   content += F("});},2000);</script>");
 
   content += "<a href='/config'><button class='secondary'>Configuration</button></a>";
@@ -824,7 +1073,7 @@ void handleToggleChildLock() {
   configDirty = true;
   lastChangeTime = millis();
   mqttPublishAll();
-  server.sendHeader(F("Location"), F("/"), true);
+  server.sendHeader("Location", "/", true);
   server.send(303, "text/plain", "");
 }
 
@@ -836,31 +1085,30 @@ void handleSetPob() {
     lastChangeTime = millis();
     mqttPublishAll();
   }
-  server.sendHeader(F("Location"), F("/"), true);
+  server.sendHeader("Location", "/", true);
   server.send(303, "text/plain", "");
 }
 
 void handleApiSensors() {
-  if (appCfg.auth_root && !server.authenticate(appCfg.user_root, appCfg.pass_root)) return; // AJAX silent auth check
-  double rv = (appCfg.cal_voltage > 0) ? (cse_voltage / appCfg.cal_voltage) : 0;
-  double ri = (appCfg.cal_current > 0) ? (cse_current / appCfg.cal_current) : 0;
-  double rp = (appCfg.cal_power > 0) ? (cse_power / appCfg.cal_power) : 0;
-
+  if (appCfg.auth_root && !server.authenticate(appCfg.user_root, appCfg.pass_root)) return; // AJAX silent check
   char buffer[256];
-  snprintf(buffer, sizeof(buffer), "%.1f|%.3f|%.1f|%.2f|%s|%d|%d|%.6f|%.6f|%.6f|%.2f|%.4f|%.2f|%d|%d|%d|%d|%d",
+  snprintf(buffer, sizeof(buffer), "%.1f|%.3f|%.1f|%.2f|%s|%d|%d|%.6f|%.6f|%.6f|%.2f|%.4f|%.2f|%d|%d|%d|%d|%d|%.1f|%lu|%lu|%lu|%lu",
     cse_voltage, cse_current, cse_power, cse_pf, 
     calStatusMsg.c_str(), calSamples, isCalibrating ? 1 : 0,
     appCfg.cal_voltage, appCfg.cal_current, appCfg.cal_power,
-    rv, ri, rp,
+    cse_raw_v, cse_raw_i, cse_raw_p,
     appCfg.relay_state[0], appCfg.relay_state[1], appCfg.relay_state[2], appCfg.relay_state[3],
-    appCfg.child_lock ? 1 : 0
+    appCfg.child_lock ? 1 : 0,
+    (float)(ESP.getFreeHeap() / 1024.0),
+    wifiConnectCount, wifiDisconnectCount,
+    mqttConnectCount, mqttDisconnectCount
   );
   server.send(200, "text/plain", buffer);
 }
 
 void handleOpenHABGen() {
   if (!checkAuth(appCfg.auth_config, appCfg.user_config, appCfg.pass_config)) return;
-
+  
   char safeId_buf[32];
   strlcpy(safeId_buf, mqttCfg.client_id, sizeof(safeId_buf));
   for (int i = 0; i < sizeof(safeId_buf) && safeId_buf[i] != '\0'; i++) {
@@ -884,6 +1132,7 @@ void handleOpenHABGen() {
   things += F("        Type number : current \"Current\" [ stateTopic=\""); things += mqttCfg.topic; things += F("/current\" ]\n");
   things += F("        Type number : power \"Power\" [ stateTopic=\""); things += mqttCfg.topic; things += F("/power\" ]\n");
   things += F("        Type number : pf \"Power Factor\" [ stateTopic=\""); things += mqttCfg.topic; things += F("/pf\" ]\n");
+  things += F("        Type string : raw \"Raw Data\" [ stateTopic=\""); things += mqttCfg.topic; things += F("/raw\" ]\n");
   things += F("}\n");
 
   String items;
@@ -898,6 +1147,7 @@ void handleOpenHABGen() {
   items += F("Number "); items += safeId_buf; items += F("_Current \"Current [%.3f A]\" { channel=\"mqtt:topic:"); items += safeId_buf; items += F(":current\" }\n");
   items += F("Number "); items += safeId_buf; items += F("_Power \"Power [%.1f W]\" { channel=\"mqtt:topic:"); items += safeId_buf; items += F(":power\" }\n");
   items += F("Number "); items += safeId_buf; items += F("_PF \"Power Factor [%.2f]\" { channel=\"mqtt:topic:"); items += safeId_buf; items += F(":pf\" }\n");
+  items += F("String "); items += safeId_buf; items += F("_Raw \"Raw Data [%s]\" { channel=\"mqtt:topic:"); items += safeId_buf; items += F(":raw\" }\n");
 
   String html;
   html.reserve(things.length() + items.length() + 600);
@@ -962,14 +1212,14 @@ void handleESPHomeGen() {
   server.send(200, "text/html", html);
 }
 
-// ... (Restul paginilor de Configurare sunt similare cu proiectul anterior, adaptate minimal)
+// ... (The rest of the Configuration pages are similar to the previous project, minimally adapted)
 void pageConfig() {
   if (!checkAuth(appCfg.auth_config, appCfg.user_config, appCfg.pass_config)) return;
   String content;
   content.reserve(3000);
   content = "<h2>Configuration</h2>";
   
-  // Script for dynamic testing (AJAX)
+  // Dynamic testing script (AJAX)
   content += "<script>";
   content += "function testMqtt() {";
   content += "  var btn = document.getElementById('testBtn');";
@@ -1008,70 +1258,71 @@ void pageConfig() {
   content += "<button type='submit'>Save Connection</button>";
   content += "</form></fieldset>";
 
-  // MQTT Topics
-  content += "<fieldset><legend>MQTT Topics</legend>";
+  // Additional Configs
+  content += "<fieldset><legend>Additional Configs</legend>";
   content += "<form action='/save_topic' method='POST'>";
-  content += F("Base Topic:<br><input name='topic' value='"); content += mqttCfg.topic; content += F("'><br>");
-  content += "<button type='submit'>Save Topic</button>";
-  content += "</form></fieldset>";
-
-  // mDNS Configuration
-  content += "<fieldset><legend>mDNS Settings</legend>";
+  content += F("Main Topic:<br><div style='display:flex;gap:5px;'><input name='topic' value='"); content += mqttCfg.topic; 
+  content += F("'><button type='submit' style='width:auto;margin:5px 0;'>Save</button></div></form>");
+  
   content += "<form action='/save_mdns' method='POST'>";
-  content += F("Hostname:<br><input name='hostname' value='"); content += mqttCfg.mdns_hostname; content += F("'><br>");
-  content += F("<small>Accessible at: <a href='http://"); content += mqttCfg.mdns_hostname; content += F(".local'>http://"); content += mqttCfg.mdns_hostname; content += F(".local</a></small><br>");
-  content += "<button type='submit'>Save mDNS</button>";
-  content += "</form></fieldset>";
+  content += F("mDNS Hostname:<br><div style='display:flex;gap:5px;'><input name='hostname' value='"); content += mqttCfg.mdns_hostname; 
+  content += F("'><button type='submit' style='width:auto;margin:5px 0;'>Save</button></div></form>");
+
+  content += "<form action='/save_interval' method='POST'>";
+  content += F("MQTT Report Interval (1-300 sec):<br><div style='display:flex;gap:5px;'><input type='number' name='interval' min='1' max='300' value='"); content += mqttCfg.pub_interval; 
+  content += F("'><button type='submit' style='width:auto;margin:5px 0;'>Save</button></div></form>");
+  content += "</fieldset>";
   content += "</div>";
 
   // --- RIGHT COLUMN (Other) ---
   content += "<div class='col'>";
   
-  // Control MQTT
-  content += "<fieldset><legend>Control MQTT</legend>";
+  // MQTT Control
+  content += "<fieldset><legend>MQTT Control</legend>";
   content += "<form action='/save_mqtt_control' method='POST'>";
-  content += F("Stare: <b>");
-  content += (mqttCfg.enabled ? F("<span style='color:green'>ACTIVAT</span>") : F("<span style='color:red'>DEZACTIVAT</span>"));
+  content += F("Status: <b>");
+  content += (mqttCfg.enabled ? F("<span style='color:green'>ENABLED</span>") : F("<span style='color:red'>DISABLED</span>"));
   content += F("</b><br><br>");
   content += F("<button type='submit' "); if(mqttCfg.enabled) content += F("class='danger' ");
   content += F("name='enabled' value='"); content += (mqttCfg.enabled ? '0' : '1'); content += F("'>");
-  content += (mqttCfg.enabled ? F("Dezactiveaza MQTT") : F("Activeaza MQTT")); content += F("</button>");
+  content += (mqttCfg.enabled ? F("Disable MQTT") : F("Enable MQTT")); content += F("</button>");
   content += "</form>";
   content += "<form action='/force_discovery' method='POST' style='margin-top:10px;'><button type='submit' class='secondary'>Resend HA Discovery</button></form>";
-  content += F("<button onclick=\"window.location.href='/openhab'\" class='secondary' style='margin-top:10px;'>Genereaza Config OpenHAB</button>"); // Moved to F()
-  content += F("<button onclick=\"window.location.href='/esphome'\" class='secondary' style='margin-top:10px;'>Genereaza Config ESPHome</button>"); // Moved to F()
+  content += F("<button onclick=\"window.location.href='/openhab'\" class='secondary' style='margin-top:10px;'>Generate OpenHAB Config</button>"); 
+  content += F("<button onclick=\"window.location.href='/esphome'\" class='secondary' style='margin-top:10px;'>Generate ESPHome Config</button>");
   content += "</fieldset>";
 
-  // Topicuri Derivate
-  content += "<fieldset><legend>Topicuri Derivate</legend><small>";
-  content += "<code>" + String(mqttCfg.topic) + "/relay/[0-3]</code> (Stare ON/OFF)<br>";
-  content += "<code>" + String(mqttCfg.topic) + "/relay/[0-3]/set</code> (Comanda)<br>";
-  content += "<code>" + String(mqttCfg.topic) + "/relay/all/set</code> (Comanda Globala)<br>";
-  content += "<code>" + String(mqttCfg.topic) + "/voltage</code> (Tensiune V)<br>";
-  content += "<code>" + String(mqttCfg.topic) + "/current</code> (Curent A)<br>";
-  content += "<code>" + String(mqttCfg.topic) + "/power</code> (Putere W)<br>";
-  content += "<code>" + String(mqttCfg.topic) + "/pf</code> (Factor Putere)<br>";
-  content += "<code>" + String(mqttCfg.topic) + "/stats/wifi</code> (Contor WiFi)<br>";
-  content += "<code>" + String(mqttCfg.topic) + "/stats/mqtt</code> (Contor MQTT)<br>";
-  content += "<code>" + String(mqttCfg.topic) + "/stats/reset</code> (Reset Contoare)<br>";
-  content += "<code>" + String(mqttCfg.topic) + "/child_lock</code> (Stare Blocare)<br>";
-  content += "<code>" + String(mqttCfg.topic) + "/child_lock/set</code> (Comanda Blocare)<br>";
-  content += "<code>" + String(mqttCfg.topic) + "/power_on_behavior</code> (Stare: OFF, ON, PREVIOUS)<br>";
-  content += "<code>" + String(mqttCfg.topic) + "/power_on_behavior/set</code> (Comanda: 0, 1, 2 sau OFF, ON, PREVIOUS)<br>";
+  // Derived Topics
+  content += "<fieldset><legend>Derived Topics</legend><small>";
+  content += "<code>" + String(mqttCfg.topic) + "/relay/[0-3]</code> (State ON/OFF)<br>";
+  content += "<code>" + String(mqttCfg.topic) + "/relay/[0-3]/set</code> (Command)<br>";
+  content += "<code>" + String(mqttCfg.topic) + "/relay/all/set</code> (Global Command)<br>";
+  content += "<code>" + String(mqttCfg.topic) + "/voltage</code> (Voltage V)<br>";
+  content += "<code>" + String(mqttCfg.topic) + "/current</code> (Current A)<br>";
+  content += "<code>" + String(mqttCfg.topic) + "/power</code> (Power W)<br>";
+  content += "<code>" + String(mqttCfg.topic) + "/pf</code> (Power Factor)<br>";
+  content += "<code>" + String(mqttCfg.topic) + "/raw</code> (Raw values RawV/I/P)<br>";
+  content += "<code>" + String(mqttCfg.topic) + "/stats/wifi</code> (WiFi Counter)<br>";
+  content += "<code>" + String(mqttCfg.topic) + "/stats/mqtt</code> (MQTT Counter)<br>";
+  content += "<code>" + String(mqttCfg.topic) + "/stats/reset</code> (Reset Counters)<br>";
+  content += "<code>" + String(mqttCfg.topic) + "/child_lock</code> (Lock State)<br>";
+  content += "<code>" + String(mqttCfg.topic) + "/child_lock/set</code> (Lock Command)<br>";
+  content += "<code>" + String(mqttCfg.topic) + "/power_on_behavior</code> (State: OFF, ON, PREVIOUS)<br>";
+  content += "<code>" + String(mqttCfg.topic) + "/power_on_behavior/set</code> (Command: 0, 1, 2 or OFF, ON, PREVIOUS)<br>";
   content += "</small></fieldset>";
 
-  // Admin Links (Calibration, Update, Reset)
-  content += "<fieldset><legend>Administrare</legend>";
-  content += "<a href='/security'><button class='secondary'>Setari Securitate</button></a>";
-  content += "<a href='/calibration'><button class='secondary'>Calibrare Senzori Energie</button></a>";
-  content += "<form action='/update' method='GET' style='margin-top:10px;'><button type='submit' class='secondary'>Actualizare Firmware (OTA)</button></form>";
+  // Administration Links (Calibration, Update, Reset)
+  content += "<fieldset><legend>Administration</legend>";
+  content += "<a href='/security'><button class='secondary'>Security Settings</button></a>";
+  content += "<a href='/calibration'><button class='secondary'>Energy Sensor Calibration</button></a>";
+  content += "<form action='/update' method='GET' style='margin-top:10px;'><button type='submit' class='secondary'>Firmware Update (OTA)</button></form>";
   content += "<form action='/reset' method='POST' onsubmit='return confirm(\"Reset?\");' style='margin-top:10px;'><button class='danger'>Factory Reset</button></form>";
   content += "</fieldset>";
   
-  content += "</div>"; // End Right Col
+  content += "</div>"; // End Col Dreapta
   content += "</div>"; // End Row
 
-  content += "<br><a href='/' style='display:block;text-align:center;'>&laquo; Inapoi la Status</a>";
+  content += "<br><a href='/' style='display:block;text-align:center;'>&laquo; Back to Status</a>";
   
   server.send(200, "text/html", renderPage("Config", content));
 }
@@ -1095,7 +1346,7 @@ void pageSecurity() {
   content += "Password:<br><input name='pass_config' type='" + String(appCfg.mask_auth_config ? "password" : "text") + "' value='" + String(appCfg.pass_config) + "'><br>";
   content += "</fieldset>";
 
-  content += "<fieldset><legend>Passwords & Visibility</legend>";
+  content += "<fieldset><legend>Passwords and Visibility</legend>";
   content += "OTA Password:<br><input name='ota_pass' value='" + String(appCfg.ota_pass) + "'><br>";
   content += "<label><input type='checkbox' name='mask_wifi' value='1' " + String(appCfg.mask_wifi ? "checked" : "") + "> Mask WiFi password in Setup</label><br>";
   content += "<label><input type='checkbox' name='mask_mqtt' value='1' " + String(appCfg.mask_mqtt ? "checked" : "") + "> Mask MQTT password in Config</label><br>";
@@ -1107,7 +1358,7 @@ void pageSecurity() {
   content += "</form>";
   content += "<br><a href='/config'><button class='secondary'>Back to Configuration</button></a>";
   
-  server.send(200, "text/html", renderPage("Securitate", content));
+  server.send(200, "text/html", renderPage("Security", content));
 }
 
 void pageCalibration() {
@@ -1122,6 +1373,11 @@ void pageCalibration() {
   content += F("<b>Power:</b> <span id='pwr'>"); content += String(cse_power, 1); content += F("</span> W</div>");
   
   content += F("<div style='border-left:1px solid #ddd; padding-left:20px;'>");
+  content += F("<b>Raw V:</b> <span id='raw_v'>"); content += String(appCfg.cal_voltage > 0 ? cse_voltage/appCfg.cal_voltage : 0, 2); content += F("</span><br>");
+  content += F("<b>Raw I:</b> <span id='raw_i'>"); content += String(appCfg.cal_current > 0 ? cse_current/appCfg.cal_current : 0, 4); content += F("</span><br>");
+  content += F("<b>Raw P:</b> <span id='raw_p'>"); content += String(appCfg.cal_power > 0 ? cse_power/appCfg.cal_power : 0, 2); content += F("</span></div>");
+
+  content += F("<div style='border-left:1px solid #ddd; padding-left:20px;'>");
   content += F("<b>Voltage Factor:</b> <span id='f_volt'>"); content += String(appCfg.cal_voltage, 6); content += F("</span><br>");
   content += F("<b>Current Factor:</b> <span id='f_curr'>"); content += String(appCfg.cal_current, 6); content += F("</span><br>");
   content += F("<b>Power Factor:</b> <span id='f_pwr'>"); content += String(appCfg.cal_power, 6); content += F("</span></div></div>");
@@ -1135,6 +1391,10 @@ void pageCalibration() {
   content += F("document.getElementById('volt').innerText=p[0];");
   content += F("document.getElementById('curr').innerText=p[1];");
   content += F("document.getElementById('pwr').innerText=p[2];");
+  content += F("if(p.length>12){");
+  content += F("document.getElementById('raw_v').innerText=p[10];");
+  content += F("document.getElementById('raw_i').innerText=p[11];");
+  content += F("document.getElementById('raw_p').innerText=p[12];}");
   content += F("if(p.length>9){");
   content += F("document.getElementById('f_volt').innerText=p[7];");
   content += F("document.getElementById('f_curr').innerText=p[8];");
@@ -1143,7 +1403,7 @@ void pageCalibration() {
   content += F("document.getElementById('calStatus').innerText=p[4];");
   content += F("document.getElementById('calSamples').innerText=p[5];");
   content += F("var isCal=p[6]==='1';");
-  content += F("var hasRes=p[4].indexOf('reusita')!==-1;");
+  content += F("var hasRes=p[4].indexOf('successful')!==-1;");
   content += F("var box=document.getElementById('calBox');");
   content += F("box.style.display=(isCal||hasRes)?'block':'none';");
   content += F("box.style.background=isCal?'#fff3cd':'#d4edda';}");
@@ -1152,7 +1412,7 @@ void pageCalibration() {
   content += "<div class='row'><div class='col'>";
   
   content += F("<fieldset><legend>Auto Calibration</legend>");
-  content += F("<p><small>Enter the real power (W). The system uses the Voltage Factor as a fixed reference.</small></p>");
+  content += F("<p><small>Enter the real power (W). The system will use the set Voltage Factor as a fixed reference.</small></p>");
   content += F("<form action='/do_calibrate' method='POST'>");
   content += F("Real Power (W):<br><div style='display:flex;gap:5px;'><input name='target_p' placeholder='e.g., 60'><button type='submit' name='type' value='p' class='secondary' style='width:auto;margin:5px 0;'>Calibrate</button></div>");
   content += F("</form></fieldset>");
@@ -1165,7 +1425,7 @@ void pageCalibration() {
   content += F("</fieldset>");
   content += "</div></div>"; // End Row
   content += "<br><a href='/config'><button class='secondary'>Back to Configuration</button></a>";
-  server.send(200, "text/html", renderPage("Calibrare", content));
+  server.send(200, "text/html", renderPage("Calibration", content));
 }
 
 void pageManualCalibration() {
@@ -1173,16 +1433,22 @@ void pageManualCalibration() {
   String content;
   content.reserve(3000);
   content = F("<h2>Advanced Calibration Settings</h2>");
-  content += F("<div class='info'><b>Raw Values:</b> V:<span id='raw_v'>");
-  content += String(cse_voltage/appCfg.cal_voltage, 2);
-  content += F("</span> | I:<span id='raw_i'>");
-  content += String(cse_current/appCfg.cal_current, 4);
-  content += F("</span> | P:<span id='raw_p'>");
-  content += String(cse_power/appCfg.cal_power, 2);
-  content += F("</span></div>");
+  
+  content += F("<div class='info' style='display:flex; justify-content:space-between; align-items:flex-start;'><div>");
+  content += F("<b>Voltage:</b> <span id='volt'>"); content += String(cse_voltage, 1); content += F("</span> V<br>");
+  content += F("<b>Current:</b> <span id='curr'>"); content += String(cse_current, 3); content += F("</span> A<br>");
+  content += F("<b>Power:</b> <span id='pwr'>"); content += String(cse_power, 1); content += F("</span> W</div>");
+  content += F("<div style='border-left:1px solid #ddd; padding-left:20px;'>");
+  content += F("<b>Raw V:</b> <span id='raw_v'>"); content += String(appCfg.cal_voltage > 0 ? cse_voltage/appCfg.cal_voltage : 0, 2); content += F("</span><br>");
+  content += F("<b>Raw I:</b> <span id='raw_i'>"); content += String(appCfg.cal_current > 0 ? cse_current/appCfg.cal_current : 0, 4); content += F("</span><br>");
+  content += F("<b>Raw P:</b> <span id='raw_p'>"); content += String(appCfg.cal_power > 0 ? cse_power/appCfg.cal_power : 0, 2); content += F("</span></div>");
+  content += F("<div style='border-left:1px solid #ddd; padding-left:20px;'>");
+  content += F("<b>Voltage Factor:</b> <span id='f_volt'>"); content += String(appCfg.cal_voltage, 6); content += F("</span><br>");
+  content += F("<b>Current Factor:</b> <span id='f_curr'>"); content += String(appCfg.cal_current, 6); content += F("</span><br>");
+  content += F("<b>Power Factor:</b> <span id='f_pwr'>"); content += String(appCfg.cal_power, 6); content += F("</span></div></div>");
   
   content += F("<div class='row'><div class='col'><fieldset><legend>Calibration via Target Values</legend>");
-  content += F("<p><small>Calculate factors by providing real measured values.</small></p>");
+  content += F("<p><small>Calculate factors by providing real values.</small></p>");
   content += F("<form action='/do_calibrate' method='POST'>");
   content += F("Real Voltage (V):<br><div style='display:flex;gap:5px;'><input name='target_v' placeholder='e.g., 235'><button type='submit' name='type' value='v' class='secondary'>Set</button></div>");
   content += F("Real Current (A):<br><div style='display:flex;gap:5px;'><input name='target_c' placeholder='e.g., 0.5'><button type='submit' name='type' value='c' class='secondary'>Set</button></div>");
@@ -1200,10 +1466,18 @@ void pageManualCalibration() {
   content += "<br><a href='/calibration'><button class='secondary'>Back</button></a>";
   
   content += F("<script>setInterval(function(){fetch('/api/sensors').then(r=>r.text()).then(v=>{");
-  content += F("var p=v.split('|');if(p.length>12){");
+  content += F("var p=v.split('|');");
+  content += F("document.getElementById('volt').innerText=p[0];");
+  content += F("document.getElementById('curr').innerText=p[1];");
+  content += F("document.getElementById('pwr').innerText=p[2];");
+  content += F("if(p.length>12){");
   content += F("document.getElementById('raw_v').innerText=p[10];");
   content += F("document.getElementById('raw_i').innerText=p[11];");
   content += F("document.getElementById('raw_p').innerText=p[12];}");
+  content += F("if(p.length>9){");
+  content += F("document.getElementById('f_volt').innerText=p[7];");
+  content += F("document.getElementById('f_curr').innerText=p[8];");
+  content += F("document.getElementById('f_pwr').innerText=p[9];}");
   content += F("});},1000);</script>");
 
   server.send(200, "text/html", renderPage("Manual Cal", content));
@@ -1231,11 +1505,11 @@ void handleDoCalibrate() {
       sumRawV = 0; sumRawI = 0; sumRawP = 0; calSamples = 0;
       calStartTime = millis();
       isCalibrating = true;
-      calStatusMsg = "Load stabilization... Please wait.";
+      calStatusMsg = "Stabilizing load... Please wait.";
     }
   }
   saveAppConfig();
-  // Explicit redirect back to calibration
+  // Explicit redirect back to calibration if Referer is not available
   server.sendHeader("Location", "/calibration", true);
   server.send(303);
 }
@@ -1286,7 +1560,7 @@ void handleSaveMdns() {
       saveMqttConfig();
     }
   }
-  server.send(200, "text/html", "Salvat! Se restarteaza... <script>setTimeout(function(){window.location.href='/config';}, 3000);</script>");
+  server.send(200, "text/html", "Saved! Rebooting... <script>setTimeout(function(){window.location.href='/config';}, 3000);</script>");
   delay(1000);
   ESP.restart();
 }
@@ -1296,6 +1570,19 @@ void handleSaveTopic() {
   if (server.hasArg("topic")) strlcpy(mqttCfg.topic, server.arg("topic").c_str(), sizeof(mqttCfg.topic));
   saveMqttConfig();
   mqtt.disconnect();
+  server.sendHeader("Location", "/config");
+  server.send(303);
+}
+
+void handleSaveInterval() {
+  if (!checkAuth(appCfg.auth_config, appCfg.user_config, appCfg.pass_config)) return;
+  if (server.hasArg("interval")) {
+    int val = server.arg("interval").toInt();
+    if (val < 1) val = 1;
+    if (val > 300) val = 300; // Limita extinsa la 5 minute
+    mqttCfg.pub_interval = (uint16_t)val;
+    saveMqttConfig();
+  }
   server.sendHeader("Location", "/config");
   server.send(303);
 }
@@ -1348,7 +1635,7 @@ void handleSaveCalibration() {
   if (changed) {
     saveAppConfig();
   }
-
+  
   server.sendHeader(F("Location"), F("/calibration"));
   server.send(303);
 }
@@ -1373,17 +1660,14 @@ void handleTestMqtt() {
   testClient.disconnect();
   
   if (res) server.send(200, "text/plain", "<span style='color:green'>Connection SUCCESSFUL!</span>");
-  else server.send(200, "text/plain", "<span style='color:red'>Conexiune ESUATA!</span>");
+  else server.send(200, "text/plain", "<span style='color:red'>Connection FAILED!</span>");
 }
 
 void handleResetStats() {
   if (!checkAuth(appCfg.auth_config, appCfg.user_config, appCfg.pass_config)) return;
   if (server.hasArg("type")) {
-    if (server.arg("type") == "wifi") wifiConnectCount = 0;
-    if (server.arg("type") == "mqtt") mqttConnectCount = 0;
-  } else {
-    wifiConnectCount = 0;
-    mqttConnectCount = 0;
+    if (server.arg("type") == "wifi") wifiDisconnectCount = 0;
+    if (server.arg("type") == "mqtt") mqttDisconnectCount = 0;
   }
   mqttPublishAll();
   server.sendHeader("Location", "/");
@@ -1401,7 +1685,7 @@ void cleanupUnusedFiles() {
     String cleanName = fileName;
     if (cleanName.startsWith("/")) cleanName = cleanName.substring(1);
     
-    // Keep essential config files
+    // Keep essential configuration files
     if (cleanName != "wifi.bin" && cleanName != "mqtt.bin" && cleanName != "app.bin") {
       filesToDelete += fileName + "\n";
     }
@@ -1430,17 +1714,17 @@ void pageSetup() {
   content.reserve(2048);
   content = F("<h2>WiFi Configuration</h2>");
 
-  // Saved network notification
+  // Saved network notice
   if (strlen(wifiCfg.ssid) > 0) {
     content += F("<div class='info' style='background:#e7f3fe; border-left:6px solid #2196F3; padding:10px;'>");
-    content += F("<strong>Notificare:</strong> Există deja o rețea WiFi salvată în memorie. Introducerea unor date noi va suprascrie configurația anterioară.");
+    content += F("<strong>Notice:</strong> There is already a WiFi network saved in memory. Entering new data will overwrite the previous configuration.");
     content += F("</div><br>");
   }
 
-  // List scanned networks
+  // List of scanned networks
   content += F("<fieldset style='margin-bottom:20px;'><legend>Available Networks (Click to select)</legend>");
   if (n == 0) {
-    content += F("<p>Nu au fost găsite rețele. Reîncărcați pagina pentru a scana din nou.</p>");
+    content += F("<p>No networks found. Reload the page to scan again.</p>");
   } else {
     content += F("<div style='max-height:200px; overflow-y:auto;'>");
     for (int i = 0; i < n; ++i) {
@@ -1458,13 +1742,13 @@ void pageSetup() {
     content += F("</div>");
   }
   content += F("</fieldset>");
-  WiFi.scanDelete(); // Free scan memory
+  WiFi.scanDelete(); // Free memory used by scan
 
   content += F("<form action='/save_wifi' method='POST'>");
-  content += F("SSID:<br><input name='ssid' placeholder='Nume rețea' required autocapitalize='none' autocorrect='off'><br>");
-  content += "Parolă:<br><input name='pass' type='" + String(appCfg.mask_wifi ? "password" : "text") + "' placeholder='Parolă rețea' autocapitalize='none' autocorrect='off'><br><br>";
-  content += F("<label><input type='checkbox' name='clean' value='1'> Curăță fișiere inutile (ex. Tasmota)</label><br><br>");
-  content += F("<button type='submit'>Salvează și Conectează</button>");
+  content += F("SSID:<br><input name='ssid' placeholder='Network name' required autocapitalize='none' autocorrect='off'><br>");
+  content += "Password:<br><input name='pass' type='" + String(appCfg.mask_wifi ? "password" : "text") + "' placeholder='Network password' autocapitalize='none' autocorrect='off'><br><br>";
+  content += F("<label><input type='checkbox' name='clean' value='1'> Clean up unnecessary files (e.g. Tasmota)</label><br><br>");
+  content += F("<button type='submit'>Save and Connect</button>");
   content += F("</form>");
 
   server.send(200, "text/html", renderPage("Setup", content));
@@ -1477,7 +1761,7 @@ void handleSaveWifi() {
   if (server.hasArg("clean") && server.arg("clean") == "1") {
     cleanupUnusedFiles();
   }
-  server.send(200, "text/html", "Rebooting...");
+  server.send(200, "text/html", "Restarting...");
   delay(1000);
   ESP.restart();
 }
@@ -1488,14 +1772,14 @@ void handleReset() {
   ESP.restart();
 }
 
-// Standard Update handlers
+// Update handlers (Standard)
 void handleUpdatePage() {
   if (!checkAuth(appCfg.auth_config, appCfg.user_config, appCfg.pass_config)) return;
   String content = "<h2>Update</h2><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='update'><button>Upload</button></form>";
   server.send(200, "text/html", renderPage("Update", content));
 }
 void handleUpdateUpload() {
-  // Check auth before processing any chunk
+  // Verificăm autentificarea înainte de a procesa orice fragment (chunk) din upload
   if (appCfg.auth_config && !server.authenticate(appCfg.user_config, appCfg.pass_config)) {
     return; 
   }
@@ -1515,24 +1799,24 @@ void handleUpdateFinish() {
 void setup() {
   // ESP8285 Fix: Disable sleep for stability
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
-  WiFi.persistent(false); // Disable SDK automatic flash writing
+  WiFi.persistent(false); // Disable automatic credential writing to flash by the SDK
   
   // Pin Configuration
   for(int i=0; i<RELAY_COUNT; i++) {
     pinMode(RELAY_PINS[i], OUTPUT);
-    // Initial state (OFF) considering inversion
+    // Initialize state (OFF) accounting for inversion
     digitalWrite(RELAY_PINS[i], RELAY_INVERTED[i] ? HIGH : LOW);
   }
-  pinMode(BTN_PIN, INPUT); // GPIO16 has no internal pullup
+  pinMode(BTN_PIN, INPUT); // GPIO16 has no internal PULLUP, use INPUT (assume external pull-down/up)
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH); // LED OFF
 
-  // Disable Hardware Serial to avoid conflicts
+  // Stop Hardware Serial to free pins and avoid conflicts
   Serial.end();
 
   // Initialize Software Serial (RX=3, TX=1)
   cseSerial.begin(4800, SWSERIAL_8E1);
-  // Force Pullup on RX (GPIO3)
+  // Force Pullup on RX (GPIO3) after initialization for stability
   pinMode(3, INPUT_PULLUP);
   delay(100);
   cseSerial.write(0x55); // Send sync
@@ -1540,22 +1824,25 @@ void setup() {
   loadConfig();
 
   // Apply Power-on behavior
-  if (appCfg.power_on_behavior == 0) {
+  if (appCfg.power_on_behavior == 0) { // All OFF
     for(int i=0; i<RELAY_COUNT; i++) appCfg.relay_state[i] = false;
-  } else if (appCfg.power_on_behavior == 1) {
+  } else if (appCfg.power_on_behavior == 1) { // All ON
     for(int i=0; i<RELAY_COUNT; i++) appCfg.relay_state[i] = true;
   }
+  // If 2 (Previous), use appCfg.relay_state loaded from flash.
 
-  // Initialize hardware relays
+  // Initialize relay hardware
   for(int i=0; i<RELAY_COUNT; i++) {
     setRelay(i, appCfg.relay_state[i]);
   }
 
   wifiConnectHandler = WiFi.onStationModeGotIP([](const WiFiEventStationModeGotIP& event) { wifiConnectCount++; });
+  wifiDisconnectHandler = WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected& event) { wifiDisconnectCount++; });
+  last_mqtt_report_time = millis(); // Initialize reporting timer
 
   if (!connectWiFi()) {
     setupMode = true;
-    // AP_STA Mode: allows config while scanning in background
+    // AP_STA mode: Allows AP for config but also background scanning/connection
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP("NOUS-Setup");
     
@@ -1563,7 +1850,7 @@ void setup() {
     ArduinoOTA.setPassword(appCfg.ota_pass);
     ArduinoOTA.begin();
     
-    server.on("/", pageSetup); // In AP mode, only setup page
+    server.on("/", pageSetup); // In AP mode, show initial setup page
     server.on("/save_wifi", handleSaveWifi);
   } else {
     setupMode = false;
@@ -1574,7 +1861,7 @@ void setup() {
 
 // ================= AUXILIARY HANDLERS =================
 void handleButtons() {
-  // --- Digital Button (GPIO 16) ---
+  // --- Buton Digital (GPIO 16) ---
   static int lastBtnState = HIGH;
   static unsigned long btnPressTime = 0;
   int reading = digitalRead(BTN_PIN);
@@ -1586,16 +1873,16 @@ void handleButtons() {
   if (reading == HIGH && lastBtnState == LOW) { // Release
     unsigned long duration = millis() - btnPressTime;
     if (duration > 50 && duration < 5000) {
-      // Short press: Toggle All
+      // Short press: Toggle All (if not Child Lock)
       if (!appCfg.child_lock) toggleAll();
     } else if (duration > 10000) {
-      // Long press (>10s): Reset WiFi
+      // Long press (>10s): Factory Reset (if not Child Lock)
       if (!appCfg.child_lock) handleReset();
     }
   }
   lastBtnState = reading;
 
-  // --- Analog Buttons (ADC) ---
+  // --- Butoane Analogice (ADC) ---
   static unsigned long lastAdcTime = 0;
   static int btnState = 0; // 0: None, 1: Btn1, 2: Btn2, 3: Btn3
   
@@ -1609,9 +1896,9 @@ void handleButtons() {
     else if (adcValue > ADC_BTN3_MIN && adcValue < ADC_BTN3_MAX) detectedBtn = 3;
     
     if (detectedBtn != 0 && btnState == 0) {
-        // Button transition
+        // Button pressed
         btnState = detectedBtn;
-        int relayIdx = detectedBtn - 1;
+        int relayIdx = detectedBtn - 1; // Btn1 -> Relay 0, etc.
         if (relayIdx >= 0 && relayIdx < 3) {
               if (!appCfg.child_lock) {
                 setRelay(relayIdx, !appCfg.relay_state[relayIdx]);
@@ -1627,14 +1914,14 @@ void handleButtons() {
 }
 
 void handlePeriodicUpdates() {
-  // Periodic MQTT Energy Publish
+  // Periodic MQTT publication (Energy)
   static unsigned long lastMqttEnergy = 0;
   if (millis() - lastMqttEnergy > MQTT_PUB_INTERVAL) {
     lastMqttEnergy = millis();
     mqttPublishEnergy();
   }
 
-  // Retry CSE7766 if no data
+  // Retry CSE7766: If no data received, send start command again
   static unsigned long lastCseRetry = 0;
   if (millis() - lastCsePacketTime > CSE_RETRY_INTERVAL && millis() - lastCseRetry > 1000) {
     lastCseRetry = millis();
@@ -1653,7 +1940,7 @@ void handlePeriodicUpdates() {
     digitalWrite(LED_PIN, LOW); 
   }
 
-  // Periodic WiFi check / Auto-reconnect
+  // Periodic WiFi connection check (Auto-reconnect)
   static unsigned long lastWifiCheck = 0;
   static unsigned long lastDisconnectTime = 0;
 
@@ -1668,12 +1955,12 @@ void handlePeriodicUpdates() {
     lastWifiCheck = millis();
 
     if (status != WL_CONNECTED && strlen(wifiCfg.ssid) > 0) {
-      // Reconnect only if not in progress
+      // Try reconnecting only if not already in progress
       if (status != WL_DISCONNECTED) {
       WiFi.begin(wifiCfg.ssid, wifiCfg.pass);
       }
 
-      // AP Fallback after 5 minutes
+      // If more than 5 minutes have passed, activate AP mode for emergency
       if (!setupMode && lastDisconnectTime > 0 && (millis() - lastDisconnectTime > 300000)) { 
         setupMode = true;
         WiFi.mode(WIFI_AP_STA);
@@ -1684,21 +1971,21 @@ void handlePeriodicUpdates() {
     }
   }
 
-  // Post-Setup mode transition
+  // If in Setup Mode and just connected to saved WiFi
   if (setupMode && WiFi.status() == WL_CONNECTED) {
       setupMode = false;
-      WiFi.mode(WIFI_STA);
-      startNormalServices();
-      digitalWrite(LED_PIN, LOW);
+      WiFi.mode(WIFI_STA); // Stop AP mode
+      startNormalServices(); // Initialize monitoring and MQTT services
+      digitalWrite(LED_PIN, LOW); // LED ON (Inverted)
   }
 
-  // Safety Power Limit check
-  if (cse_power > MAX_POWER_LIMIT) {
+  // Hardware Overload Protection
+  if (cse_power > MAX_POWER_LIMIT) { 
     for(int i=0; i<RELAY_COUNT; i++) setRelay(i, false);
     calStatusMsg = "ALARM: POWER LIMIT EXCEEDED!";
   }
 
-  // Calibration finalization
+  // Finish calibration after duration
   if (isCalibrating && (millis() - calStartTime > CAL_TOTAL_DURATION)) {
     if (calSamples > 5) {
       double avgRawV = sumRawV / calSamples;
@@ -1706,16 +1993,17 @@ void handlePeriodicUpdates() {
       double avgRawP = sumRawP / calSamples;
 
       if (avgRawP > 0.1 && avgRawV > 10.0 && avgRawI > 0.001) {
-        // 1. Calibrate Power (P)
+        // 1. Calibrate Power (P) to match the real target load
         appCfg.cal_power = (float)(calTargetP / avgRawP);
         
-        // 2. Adjust Current (I) based on already calibrated Voltage
+        // 2. Adjust Current (I) relative to ALREADY CALIBRATED voltage
+        // Target_I = Target_P / Actual_Calibrated_V
         double vCalibratActual = avgRawV * appCfg.cal_voltage;
         appCfg.cal_current = (float)((calTargetP / vCalibratActual) / avgRawI);
 
-        calStatusMsg = "Calibration Successful! P & I updated (Ref V: " + String(vCalibratActual, 1) + "V)";
+        calStatusMsg = "Calibration successful! P and I updated (Ref V: " + String(vCalibratActual, 1) + "V)";
       } else {
-        calStatusMsg = "Error: Invalid values during sampling.";
+        calStatusMsg = "Error: Invalid values detected during sampling.";
       }
       saveAppConfig();
     }
@@ -1731,12 +2019,19 @@ void loop() {
   if (!setupMode) {
     mqtt.loop();
     mqttConnect();
+    
+    // Monitorizare deconectari MQTT
+    bool currentMqttState = mqtt.connected();
+    if (lastMqttConnectedState && !currentMqttState) {
+        mqttDisconnectCount++;
+    }
+    lastMqttConnectedState = currentMqttState;
   }
 
-  // Read energy data (always runs)
+  // Read energy data and protection (always running)
   handleCSE7766();
 
-  // Delayed flash save
+  // Delayed save to LittleFS
   if (configDirty && millis() - lastChangeTime > CFG_SAVE_DELAY) {
     saveAppConfig();
     configDirty = false;

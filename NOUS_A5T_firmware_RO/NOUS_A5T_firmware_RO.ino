@@ -2,7 +2,7 @@
  * Firmware Custom pentru NOUS A5T (ESP8266 / ESP8285)
  * Bazat pe template Tasmota: {"NAME":"NOUS A5T","GPIO":[0,3072,544,3104,0,259,0,0,225,226,224,0,35,4704],"FLAG":1,"BASE":18}
  */
-#define FW_VERSION "2.7.0"
+#define FW_VERSION "2.7.1"
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -13,6 +13,7 @@
 #include <PubSubClient.h>
 #include <LittleFS.h>
 #include <SoftwareSerial.h>
+#include <stdlib.h>
 
 // ================= PINS =================
 const int RELAY_PINS[] = {14, 12, 13, 5}; // R1, R2, R3, R4(USB)
@@ -23,17 +24,25 @@ const int LED_PIN = 2;  // GPIO2 (LED Link)
 
 // ================= CONSTANTS =================
 // Valori implicite (Factory Defaults) pentru calibrare
-#define DEFAULT_CAL_V 2.365000f
-#define DEFAULT_CAL_I 1.025885f
-#define DEFAULT_CAL_P 2.514068f
+#define DEFAULT_CAL_V 2.380000f
+#define DEFAULT_CAL_I 0.930000f
+#define DEFAULT_CAL_P 2.510000f
 
 // Interval Timp (ms)
-#define MQTT_PUB_INTERVAL 5000
+#define MQTT_PUB_INTERVAL 1000
 #define MQTT_RECONNECT_INTERVAL 15000
 #define CAL_STABILIZE_DELAY 1000
 #define CAL_TOTAL_DURATION 15000
 #define CFG_SAVE_DELAY 5000
 #define CSE_RETRY_INTERVAL 3000
+#define LOW_POWER_THRESHOLD 15.0f // Prag putere (W) sub care se aplica media pe 15s
+#define LONG_AVG_INTERVAL 15000 // Interval de mediere lunga (15 secunde in ms)
+#define P_NOISE_MIN          0.30f     // sub 0.3W = zgomot
+#define I_NOISE_MIN          0.03f     // sub 30mA = zgomot
+#define P_DEADBAND           0.4f      // sub 0.4 W -> consider 0
+#define P_OFFSET             4.6f      // offset determinat pentru consum propriu
+#define EMA_ALPHA            0.10f     // Factor de netezire (EMA) global
+#define MAX_P_SAMPLES        2500      // Suport pentru 300s (5 min) cu marja de siguranta
 #define MAX_POWER_LIMIT 3680.0f // Limita 16A la 230V
 #define CONFIG_MAGIC 0xA5A50005 // Versiune configuratie
 
@@ -60,6 +69,7 @@ struct MqttConfig {
   char topic[32];
   bool enabled;
   char mdns_hostname[32];
+  uint16_t pub_interval; // Interval raportare in secunde
 };
 
 struct AppConfig {
@@ -98,19 +108,47 @@ SoftwareSerial cseSerial(3, 1); // RX=GPIO3, TX=GPIO1 (Configuratia confirmata c
 // ================= STATE =================
 bool setupMode = false;
 unsigned long wifiConnectCount = 0;
+unsigned long wifiDisconnectCount = 0;
 unsigned long mqttConnectCount = 0;
+unsigned long mqttDisconnectCount = 0;
 WiFiEventHandler wifiConnectHandler;
+WiFiEventHandler wifiDisconnectHandler;
 bool configDirty = false;
 unsigned long lastChangeTime = 0;
+bool lastMqttConnectedState = false;
 
 // CSE7766 Vars
 double cse_voltage = 0.0;
 double cse_current = 0.0;
 double cse_power = 0.0;
 double cse_pf = 0.0;
+double ema_power = 0.0;
+
+// Raw values from CSE7766 (instantaneous, uncalibrated)
+double cse_raw_v = 0.0;
+double cse_raw_i = 0.0;
+double cse_raw_p = 0.0;
+
+// Accumulators for 1-second average (used by mqttPublishEnergy to get a stable 1s value)
+double raw_v_sum_1s = 0.0;
+double raw_i_sum_1s = 0.0;
+double raw_p_sum_1s = 0.0;
+int raw_count_1s = 0;
+
 uint8_t cse_buff[32];
 int cse_idx = 0;
 unsigned long lastCsePacketTime = 0; // Timpul ultimului pachet valid (pentru retry)
+
+// Acumulatori pentru raportarea MQTT (media pe intervalul setat)
+double mqtt_raw_v_sum = 0.0;
+double mqtt_raw_i_sum = 0.0;
+double mqtt_raw_p_sum = 0.0;
+int mqtt_raw_count = 0;
+unsigned long last_mqtt_report_time = 0; // Timestamp of the last MQTT publication
+
+// Buffer pentru filtrare avansata la puteri mici (Median + Trimmed Mean)
+float pBuffer[MAX_P_SAMPLES];
+int pCount = 0;
 
 // State Calibrare
 bool isCalibrating = false;
@@ -128,6 +166,7 @@ void sendDiscoveryMessages();
 void startNormalServices();
 void pageSecurity();
 void handleSaveSecurity();
+void handleSaveInterval();
 
 // Helper pentru autentificare
 bool checkAuth(bool required, const char* user, const char* pass) {
@@ -137,6 +176,66 @@ bool checkAuth(bool required, const char* user, const char* pass) {
     return false;
   }
   return true;
+}
+
+// ================= FILTERING HELPERS (LOW POWER STABILITY) =================
+// Functie de comparatie pentru qsort
+int compareFloats(const void* a, const void* b) {
+    float fa = *(const float*)a;
+    float fb = *(const float*)b;
+    if (fa < fb) return -1;
+    if (fa > fb) return 1;
+    return 0;
+}
+
+float getMedian(float *arr, int n) {
+    if (n <= 0) return 0.0f;
+    float* temp = (float*)malloc(n * sizeof(float));
+    if (!temp) return 0.0f; // Fail safe daca RAM-ul e critic
+
+    memcpy(temp, arr, n * sizeof(float));
+    qsort(temp, n, sizeof(float), compareFloats);
+    float result = (n % 2 == 1) ? temp[n/2] : (temp[n/2 - 1] + temp[n/2]) * 0.5f;
+    free(temp);
+    return result;
+}
+
+float getTrimmedMean(float *arr, int n) {
+    if (n < 5) return getMedian(arr, n);
+    float* temp = (float*)malloc(n * sizeof(float));
+    if (!temp) return getMedian(arr, n);
+
+    memcpy(temp, arr, n * sizeof(float));
+    qsort(temp, n, sizeof(float), compareFloats);
+    int cut = n * 0.2f; // Eliminam 20% din valorile extreme (min/max)
+    if (cut < 1) cut = 1;
+    float sum = 0;
+    int count = 0;
+    for (int i = cut; i < n - cut; i++) {
+        sum += temp[i];
+        count++;
+    }
+    float result = (count > 0) ? (sum / count) : 0.0f;
+    free(temp);
+    return (result > 0) ? result : getMedian(arr, n);
+}
+
+void ingestPowerSample(double RawP, double P, double I) {
+    // Prevenție spikes (RawP > 5000 sau P > 10000 deja verificate in handleCSE7766)
+    if (RawP > 5000.0 || P > 10000.0) return;
+
+    float val = (float)P - P_OFFSET;
+    if (val < 0.0f) val = 0.0f;
+    if (val < P_DEADBAND) val = 0.0f;
+    if (I < I_NOISE_MIN) val = 0.0f;
+
+    // Filtru EMA (Exponential Moving Average) - Netezește valorile (EMA global)
+    ema_power = ema_power + (double)EMA_ALPHA * ((double)val - ema_power);
+
+    if (P < LOW_POWER_THRESHOLD && pCount < MAX_P_SAMPLES) {
+        pBuffer[pCount] = (float)ema_power;
+        pCount++;
+    }
 }
 
 // Inregistrare pagini si servicii pentru modul normal
@@ -163,6 +262,7 @@ void startNormalServices() {
     server.on("/save_connection", handleSaveConnection);
     server.on("/save_mdns", handleSaveMdns);
     server.on("/save_topic", handleSaveTopic);
+    server.on("/save_interval", handleSaveInterval);
     server.on("/save_mqtt_control", handleSaveMqttControl);
     server.on("/force_discovery", handleForceDiscovery);
     server.on("/do_calibrate", handleDoCalibrate);
@@ -247,8 +347,11 @@ void loadConfig() {
     strlcpy(mqttCfg.topic, "nous", sizeof(mqttCfg.topic));
     mqttCfg.enabled = false;
     strlcpy(mqttCfg.mdns_hostname, "NOUS-A5T", sizeof(mqttCfg.mdns_hostname));
+    mqttCfg.pub_interval = 1;
   }
   if (strlen(mqttCfg.mdns_hostname) == 0) strlcpy(mqttCfg.mdns_hostname, "NOUS-A5T", sizeof(mqttCfg.mdns_hostname));
+  if (mqttCfg.pub_interval < 1) mqttCfg.pub_interval = 1;
+  if (mqttCfg.pub_interval > 300) mqttCfg.pub_interval = 300; // Plafonare la 5 minute
 
   // App
   if (LittleFS.exists("/app.bin")) {
@@ -283,7 +386,7 @@ void loadConfig() {
     appCfg.auth_root = false;
     strlcpy(appCfg.user_root, "admin", sizeof(appCfg.user_root));
     strlcpy(appCfg.pass_root, "admin", sizeof(appCfg.pass_root));
-    strlcpy(appCfg.ota_pass, "openhab", sizeof(appCfg.ota_pass));
+    strlcpy(appCfg.ota_pass, "admin", sizeof(appCfg.ota_pass));
     appCfg.mask_wifi = false;
     appCfg.mask_mqtt = true;
     appCfg.mask_auth_root = true;
@@ -364,21 +467,120 @@ void mqttPublishState(int relayIdx) {
 }
 
 void mqttPublishEnergy() {
-  if (mqtt.connected()) {
-    char topic[64];
-    char val[16];
-    
-    snprintf(topic, sizeof(topic), "%s/voltage", mqttCfg.topic);
-    dtostrf(cse_voltage, 1, 1, val); mqtt.publish(topic, val);
-    
-    snprintf(topic, sizeof(topic), "%s/current", mqttCfg.topic);
-    dtostrf(cse_current, 1, 3, val); mqtt.publish(topic, val);
-    
-    snprintf(topic, sizeof(topic), "%s/power", mqttCfg.topic);
-    dtostrf(cse_power, 1, 1, val); mqtt.publish(topic, val);
-    
-    snprintf(topic, sizeof(topic), "%s/pf", mqttCfg.topic);
-    dtostrf(cse_pf, 1, 2, val); mqtt.publish(topic, val);
+  // Capturăm sumele brute și numărul de eșantioane acumulate în ultima secundă
+  double temp_raw_v_sum_1s = raw_v_sum_1s;
+  double temp_raw_i_sum_1s = raw_i_sum_1s;
+  double temp_raw_p_sum_1s = raw_p_sum_1s;
+  int temp_raw_count_1s = raw_count_1s;
+
+  // Resetăm acumulatorii pe 1 secundă pentru următorul interval
+  raw_v_sum_1s = 0; raw_i_sum_1s = 0; raw_p_sum_1s = 0; raw_count_1s = 0;
+
+  // Calculăm media pe 1 secundă din valorile brute colectate
+  double avg_v_1s = 0.0, avg_i_1s = 0.0, avg_p_1s = 0.0;
+  if (temp_raw_count_1s > 0) {
+    avg_v_1s = temp_raw_v_sum_1s / temp_raw_count_1s;
+    avg_i_1s = temp_raw_i_sum_1s / temp_raw_count_1s;
+    avg_p_1s = temp_raw_p_sum_1s / temp_raw_count_1s;
+    // Actualizăm variabilele de decizie
+    cse_voltage = avg_v_1s * appCfg.cal_voltage;
+    cse_current = avg_i_1s * appCfg.cal_current;
+    cse_power   = avg_p_1s * appCfg.cal_power;
+  }
+
+  // Calculăm puterea pe 1 secundă (calibrată și filtrată) pentru a decide modul de raportare
+  double calculated_p_1s = avg_p_1s * appCfg.cal_power;
+  
+  // Aplicare offset/deadband pentru decizia de raportare sub 15W
+  if (calculated_p_1s < LOW_POWER_THRESHOLD) {
+      calculated_p_1s -= P_OFFSET;
+      if (calculated_p_1s < P_DEADBAND) calculated_p_1s = 0.0;
+  }
+
+  // Dacă puterea e mică, verificăm dacă avem destule eșantioane (buffer plin) înainte de a raporta
+  if (calculated_p_1s < LOW_POWER_THRESHOLD && pCount < MAX_P_SAMPLES) return;
+
+  // 1. Acumulăm datele brute din această secundă în colectorul pentru media MQTT
+  mqtt_raw_v_sum += temp_raw_v_sum_1s;
+  mqtt_raw_i_sum += temp_raw_i_sum_1s;
+  mqtt_raw_p_sum += temp_raw_p_sum_1s;
+  mqtt_raw_count += temp_raw_count_1s;
+
+  // Calculăm intervalul țintă de raportare
+  unsigned long interval_ms = (unsigned long)mqttCfg.pub_interval * 1000;
+  if (calculated_p_1s < LOW_POWER_THRESHOLD) {
+    // Daca puterea e sub 15W, timpul de raportare este de MINIM 15s.
+    if (interval_ms < 15000) interval_ms = 15000;
+  }
+
+  // 2. Verificăm dacă a trecut timpul necesar pentru raportare (target_ms)
+  if (millis() - last_mqtt_report_time >= interval_ms) {
+    // Calculăm mediile brute pentru Tensiune si Curent
+    double avg_v = mqtt_raw_v_sum / mqtt_raw_count;
+    double avg_i = mqtt_raw_i_sum / mqtt_raw_count;
+    double avg_p = mqtt_raw_p_sum / mqtt_raw_count;
+
+    double pub_power = 0;
+    if (calculated_p_1s < LOW_POWER_THRESHOLD) {
+      // Putere mică: Aplicăm algoritmul Mediană + Trimmed Mean pe bufferul de eșantioane
+      pub_power = (double)(getMedian(pBuffer, pCount) + getTrimmedMean(pBuffer, pCount)) * 0.5;
+    } else {
+      // Putere mare: Media aritmetică pe interval (Unificare)
+      pub_power = avg_p * appCfg.cal_power;
+    }
+
+    // Resetăm acumulatorii de sesiune MQTT și buffer-ul de putere mică
+    mqtt_raw_v_sum = 0; mqtt_raw_i_sum = 0; mqtt_raw_p_sum = 0; mqtt_raw_count = 0;
+    pCount = 0; 
+    last_mqtt_report_time = millis();
+
+    // Aplicăm factorii de calibrare pe MEDIA calculată
+    double pub_voltage = avg_v * appCfg.cal_voltage;
+    double pub_current = avg_i * appCfg.cal_current;
+    double pub_pf      = 0.0;
+
+    // Aplicăm filtrele de zgomot (noise floor & suppression)
+    if (pub_current < 0.05f) pub_current *= 0.25f;
+    if (pub_power < 3.0f && calculated_p_1s >= LOW_POWER_THRESHOLD) pub_power *= 0.40f; 
+
+    // Calcul Factor de Putere (PF) pe baza mediilor
+    double apparent = pub_voltage * pub_current;
+    if (apparent > 0.5) {
+      pub_pf = pub_power / apparent;
+      if (pub_pf > 1.0) pub_pf = 1.0;
+      else if (pub_pf < 0.0) pub_pf = 0.0;
+    } else {
+      pub_pf = 1.0;
+    }
+
+    // Prag final de zgomot pentru valori neglijabile
+    if (pub_power < 0.1) {
+      pub_power = 0.0; pub_current = 0.0; pub_pf = 0.0;
+    }
+
+    // Publicăm rezultatele medii către MQTT
+    if (mqtt.connected()) {
+      char topic[64];
+      char val[16];
+      
+      snprintf(topic, sizeof(topic), "%s/voltage", mqttCfg.topic);
+      dtostrf(pub_voltage, 1, 1, val); mqtt.publish(topic, val);
+      
+      snprintf(topic, sizeof(topic), "%s/current", mqttCfg.topic);
+      dtostrf(pub_current, 1, 3, val); mqtt.publish(topic, val);
+      
+      snprintf(topic, sizeof(topic), "%s/power", mqttCfg.topic);
+      dtostrf(pub_power, 1, 1, val); mqtt.publish(topic, val);
+      
+      snprintf(topic, sizeof(topic), "%s/pf", mqttCfg.topic);
+      dtostrf(pub_pf, 1, 2, val); mqtt.publish(topic, val);
+
+      // Trimitere date brute medii pentru debug
+      char rawBuf[128];
+      snprintf(topic, sizeof(topic), "%s/raw", mqttCfg.topic);
+      snprintf(rawBuf, sizeof(rawBuf), "AvgV: %.2f | AvgI: %.4f | AvgP: %.2f (Interval: %lus)", avg_v, avg_i, avg_p, interval_ms/1000);
+      mqtt.publish(topic, rawBuf);
+    }
   }
 }
 
@@ -549,6 +751,17 @@ void sendDiscoveryMessages() {
     payload += F("}");
     mqtt.publish(topic.c_str(), payload.c_str(), true);
   }
+
+  // 6. Raw Data Sensor
+  {
+    topic = F("homeassistant/sensor/"); topic += mac; topic += F("/raw/config");
+    payload = F("{\"name\":\"Date Brute (Raw)\",\"uniq_id\":\""); payload += mac;
+    payload += F("_raw\",\"stat_t\":\""); payload += mqttCfg.topic;
+    payload += F("/raw\",\"icon\":\"mdi:code-braces\"");
+    appendDeviceConfig();
+    payload += F("}");
+    mqtt.publish(topic.c_str(), payload.c_str(), true);
+  }
 }
 
 void mqttConnect() {
@@ -627,9 +840,39 @@ void handleCSE7766() {
         unsigned long p_cycle = ((unsigned long)cse_buff[17] << 16) | ((unsigned long)cse_buff[18] << 8) | cse_buff[19];
         uint8_t adj = cse_buff[20];
 
-        if ((adj & 0x40) && v_cycle > 0) cse_voltage = ((double)v_coeff / v_cycle) * appCfg.cal_voltage; else cse_voltage = 0;
-        if ((adj & 0x20) && i_cycle > 0) cse_current = ((double)i_coeff / i_cycle) * appCfg.cal_current; else cse_current = 0;
-        if ((adj & 0x10) && p_cycle > 0) cse_power = ((double)p_coeff / p_cycle) * appCfg.cal_power; else cse_power = 0;
+        // Calculăm valorile RAW instantanee
+        double t_raw_v = (v_cycle > 0) ? (double)v_coeff / v_cycle : 0.0;
+        double t_raw_i = (i_cycle > 0) ? (double)i_coeff / i_cycle : 0.0;
+        double t_raw_p = (p_cycle > 0) ? (double)p_coeff / p_cycle : 0.0;
+        double t_power = t_raw_p * appCfg.cal_power;
+
+        // FILTRU EROARE: Ignoram citirile imposibile inainte de orice procesare
+        if (t_raw_p > 5000.0 || t_power > 10000.0) {
+          cse_idx = 0;
+          return;
+        }
+
+        cse_raw_v = t_raw_v;
+        cse_raw_i = t_raw_i;
+        cse_raw_p = t_raw_p;
+        cse_power = t_power;
+
+        // Acumulăm datele brute valide pentru media de raportare pe 1 secundă
+        raw_v_sum_1s += t_raw_v;
+        raw_i_sum_1s += t_raw_i;
+        raw_p_sum_1s += t_raw_p;
+        raw_count_1s++;
+
+        cse_voltage = t_raw_v * appCfg.cal_voltage;
+        cse_current = t_raw_i * appCfg.cal_current;
+        
+        // Ingerăm eșantionul în buffer (folosind t_raw_p, corectat fata de versiunea anterioara)
+        ingestPowerSample(t_raw_p, t_power, cse_current);
+        
+        // Filtru instantaneu pentru UI (User Interface) - Aplicam EMA global conform cerintei
+        cse_power = ema_power;
+
+        if (cse_current < 0.05f) cse_current *= 0.25f;
         
         // Corectie zgomot si calcul Power Factor
         if (cse_power < 0.1) { 
@@ -658,8 +901,8 @@ void handleCSE7766() {
 
         lastCsePacketTime = millis();
 
-        // Protectie Supra-Sarcina Hardware (Reactie imediata la citire)
-        if (cse_power > MAX_POWER_LIMIT) {
+        // Protectie Supra-Sarcina Hardware (Reactie imediata folosind valoarea instantanee t_power)
+        if (t_power > MAX_POWER_LIMIT) {
           for(int i=0; i<RELAY_COUNT; i++) setRelay(i, false);
           calStatusMsg = F("AVARIE: LIMITA PUTERE DEPASITA!");
           mqttPublishAll();
@@ -754,7 +997,7 @@ void pageStatus() {
   content += F("<div class='row'>");
 
   // 1. Consum
-  content += F("<div class='col'><fieldset><legend>Consum</legend>");
+  content += F("<div class='col'><fieldset><legend>Consum instant nefiltrat</legend>");
   content += F("<b>Tensiune:</b> <span id='volt'>"); content += cse_voltage; content += F("</span> V<br>");
   content += F("<b>Curent:</b> <span id='curr'>"); content += cse_current; content += F("</span> A<br>");
   content += F("<b>Putere:</b> <span id='pwr'>"); content += cse_power; content += F("</span> W<br>");
@@ -765,13 +1008,14 @@ void pageStatus() {
   content += F("<div class='col'><fieldset><legend>Sistem & WiFi</legend>");
   content += F("<b>Status:</b> "); 
   content += (WiFi.status() == WL_CONNECTED ? F("<span style='color:green'>Conectat</span>") : F("<span style='color:red'>Deconectat</span>"));
-  content += F("<br><div style='display:flex;align-items:center;gap:10px;margin-top:5px;'><b>Conectari:</b> ");
-  content += wifiConnectCount;
-  content += "<form action='/reset_stats' method='POST' style='margin:0;'><input type='hidden' name='type' value='wifi'><button type='submit' class='secondary' style='width:auto;padding:2px 8px;font-size:12px;margin:0;'>Reset</button></form></div>";
+  content += F("<br><b>Conectări:</b> <span id='wifiCon'>"); content += wifiConnectCount; content += F("</span>");
+  content += F("<br><div style='display:flex;align-items:center;gap:10px;margin-top:5px;'><b>Deconectări:</b> <span id='wifiDis'>");
+  content += wifiDisconnectCount;
+  content += F("</span><form action='/reset_stats' method='POST' style='margin:0;'><input type='hidden' name='type' value='wifi'><button type='submit' class='secondary' style='width:auto;padding:2px 8px;font-size:12px;margin:0;'>Reset</button></form></div>");
   content += F("<b>IP:</b> "); content += WiFi.localIP().toString();
   content += F("<br><b>Chip ID:</b> "); content += String(ESP.getChipId(), HEX);
   content += F("<br><b>Flash:</b> "); content += (ESP.getFlashChipRealSize() / 1024);
-  content += F(" KB<br><b>RAM Libera:</b> "); content += String(ESP.getFreeHeap() / 1024.0, 1);
+  content += F(" KB<br><b>RAM Liberă:</b> <span id='freeRam'>"); content += String((float)(ESP.getFreeHeap() / 1024.0), 1);
   content += F(" KB<br>");
   content += "</fieldset></div>";
 
@@ -780,9 +1024,10 @@ void pageStatus() {
   content += "<fieldset><legend>MQTT</legend>";
   content += F("<b>Status:</b> ");
   content += (mqtt.connected() ? F("<span style='color:green'>Conectat</span>") : F("<span style='color:red'>Deconectat</span>"));
-  content += F("<br><div style='display:flex;align-items:center;gap:10px;margin-top:5px;'><b>Conectari:</b> ");
-  content += mqttConnectCount;
-  content += "<form action='/reset_stats' method='POST' style='margin:0;'><input type='hidden' name='type' value='mqtt'><button type='submit' class='secondary' style='width:auto;padding:2px 8px;font-size:12px;margin:0;'>Reset</button></form></div>";
+  content += F("<br><b>Conectări:</b> <span id='mqttCon'>"); content += mqttConnectCount; content += F("</span>");
+  content += F("<br><div style='display:flex;align-items:center;gap:10px;margin-top:5px;'><b>Deconectări:</b> <span id='mqttDis'>");
+  content += mqttDisconnectCount;
+  content += F("</span><form action='/reset_stats' method='POST' style='margin:0;'><input type='hidden' name='type' value='mqtt'><button type='submit' class='secondary' style='width:auto;padding:2px 8px;font-size:12px;margin:0;'>Reset</button></form></div>");
   content += F("<b>Mod:</b> "); content += (mqttCfg.enabled ? F("Activ") : F("Inactiv"));
   content += "</fieldset></div>";
 
@@ -801,6 +1046,11 @@ void pageStatus() {
   content += F("var cl=document.getElementById('btnCL');");
   content += F("if(cl){var s=p[17]==='1';cl.innerText=s?'ON':'OFF';");
   content += F("if(s)cl.classList.remove('off');else cl.classList.add('off');}");
+  content += F("document.getElementById('freeRam').innerText=p[18];");
+  content += F("document.getElementById('wifiCon').innerText=p[19]; ");
+  content += F("document.getElementById('wifiDis').innerText=p[20]; ");
+  content += F("document.getElementById('mqttCon').innerText=p[21]; ");
+  content += F("document.getElementById('mqttDis').innerText=p[22]; ");
   content += F("});},2000);</script>");
 
   content += "<a href='/config'><button class='secondary'>Configurare</button></a>";
@@ -842,18 +1092,17 @@ void handleSetPob() {
 
 void handleApiSensors() {
   if (appCfg.auth_root && !server.authenticate(appCfg.user_root, appCfg.pass_root)) return; // AJAX silent check
-  double rv = (appCfg.cal_voltage > 0) ? (cse_voltage / appCfg.cal_voltage) : 0;
-  double ri = (appCfg.cal_current > 0) ? (cse_current / appCfg.cal_current) : 0;
-  double rp = (appCfg.cal_power > 0) ? (cse_power / appCfg.cal_power) : 0;
-
   char buffer[256];
-  snprintf(buffer, sizeof(buffer), "%.1f|%.3f|%.1f|%.2f|%s|%d|%d|%.6f|%.6f|%.6f|%.2f|%.4f|%.2f|%d|%d|%d|%d|%d",
+  snprintf(buffer, sizeof(buffer), "%.1f|%.3f|%.1f|%.2f|%s|%d|%d|%.6f|%.6f|%.6f|%.2f|%.4f|%.2f|%d|%d|%d|%d|%d|%.1f|%lu|%lu|%lu|%lu",
     cse_voltage, cse_current, cse_power, cse_pf, 
     calStatusMsg.c_str(), calSamples, isCalibrating ? 1 : 0,
     appCfg.cal_voltage, appCfg.cal_current, appCfg.cal_power,
-    rv, ri, rp,
+    cse_raw_v, cse_raw_i, cse_raw_p,
     appCfg.relay_state[0], appCfg.relay_state[1], appCfg.relay_state[2], appCfg.relay_state[3],
-    appCfg.child_lock ? 1 : 0
+    appCfg.child_lock ? 1 : 0,
+    (float)(ESP.getFreeHeap() / 1024.0),
+    wifiConnectCount, wifiDisconnectCount,
+    mqttConnectCount, mqttDisconnectCount
   );
   server.send(200, "text/plain", buffer);
 }
@@ -884,6 +1133,7 @@ void handleOpenHABGen() {
   things += F("        Type number : current \"Current\" [ stateTopic=\""); things += mqttCfg.topic; things += F("/current\" ]\n");
   things += F("        Type number : power \"Power\" [ stateTopic=\""); things += mqttCfg.topic; things += F("/power\" ]\n");
   things += F("        Type number : pf \"Power Factor\" [ stateTopic=\""); things += mqttCfg.topic; things += F("/pf\" ]\n");
+  things += F("        Type string : raw \"Date Brute\" [ stateTopic=\""); things += mqttCfg.topic; things += F("/raw\" ]\n");
   things += F("}\n");
 
   String items;
@@ -898,6 +1148,7 @@ void handleOpenHABGen() {
   items += F("Number "); items += safeId_buf; items += F("_Current \"Current [%.3f A]\" { channel=\"mqtt:topic:"); items += safeId_buf; items += F(":current\" }\n");
   items += F("Number "); items += safeId_buf; items += F("_Power \"Power [%.1f W]\" { channel=\"mqtt:topic:"); items += safeId_buf; items += F(":power\" }\n");
   items += F("Number "); items += safeId_buf; items += F("_PF \"Power Factor [%.2f]\" { channel=\"mqtt:topic:"); items += safeId_buf; items += F(":pf\" }\n");
+  items += F("String "); items += safeId_buf; items += F("_Raw \"Date Brute [%s]\" { channel=\"mqtt:topic:"); items += safeId_buf; items += F(":raw\" }\n");
 
   String html;
   html.reserve(things.length() + items.length() + 600);
@@ -1008,20 +1259,20 @@ void pageConfig() {
   content += "<button type='submit'>Salveaza Conexiune</button>";
   content += "</form></fieldset>";
 
-  // Topicuri (MUTAT AICI)
-  content += "<fieldset><legend>Topicuri MQTT</legend>";
+  // Configurări suplimentare (Comasat Topic, mDNS si Interval)
+  content += "<fieldset><legend>Configurări suplimentare</legend>";
   content += "<form action='/save_topic' method='POST'>";
-  content += F("Topic Principal:<br><input name='topic' value='"); content += mqttCfg.topic; content += F("'><br>");
-  content += "<button type='submit'>Salveaza Topic</button>";
-  content += "</form></fieldset>";
-
-  // Configurare mDNS
-  content += "<fieldset><legend>Configurare mDNS</legend>";
+  content += F("Topic Principal:<br><div style='display:flex;gap:5px;'><input name='topic' value='"); content += mqttCfg.topic; 
+  content += F("'><button type='submit' style='width:auto;margin:5px 0;'>Salvează</button></div></form>");
+  
   content += "<form action='/save_mdns' method='POST'>";
-  content += F("Hostname:<br><input name='hostname' value='"); content += mqttCfg.mdns_hostname; content += F("'><br>");
-  content += F("<small>Accesibil la: <a href='http://"); content += mqttCfg.mdns_hostname; content += F(".local'>http://"); content += mqttCfg.mdns_hostname; content += F(".local</a></small><br>");
-  content += "<button type='submit'>Salveaza mDNS</button>";
-  content += "</form></fieldset>";
+  content += F("Hostname mDNS:<br><div style='display:flex;gap:5px;'><input name='hostname' value='"); content += mqttCfg.mdns_hostname; 
+  content += F("'><button type='submit' style='width:auto;margin:5px 0;'>Salvează</button></div></form>");
+
+  content += "<form action='/save_interval' method='POST'>";
+  content += F("Interval raportare MQTT (1-300 sec):<br><div style='display:flex;gap:5px;'><input type='number' name='interval' min='1' max='300' value='"); content += mqttCfg.pub_interval; 
+  content += F("'><button type='submit' style='width:auto;margin:5px 0;'>Salvează</button></div></form>");
+  content += "</fieldset>";
   content += "</div>";
 
   // --- COLOANA DREAPTA (Restul) ---
@@ -1051,6 +1302,7 @@ void pageConfig() {
   content += "<code>" + String(mqttCfg.topic) + "/current</code> (Curent A)<br>";
   content += "<code>" + String(mqttCfg.topic) + "/power</code> (Putere W)<br>";
   content += "<code>" + String(mqttCfg.topic) + "/pf</code> (Factor Putere)<br>";
+  content += "<code>" + String(mqttCfg.topic) + "/raw</code> (Valori Brute RawV/I/P)<br>";
   content += "<code>" + String(mqttCfg.topic) + "/stats/wifi</code> (Contor WiFi)<br>";
   content += "<code>" + String(mqttCfg.topic) + "/stats/mqtt</code> (Contor MQTT)<br>";
   content += "<code>" + String(mqttCfg.topic) + "/stats/reset</code> (Reset Contoare)<br>";
@@ -1122,6 +1374,11 @@ void pageCalibration() {
   content += F("<b>Putere:</b> <span id='pwr'>"); content += String(cse_power, 1); content += F("</span> W</div>");
   
   content += F("<div style='border-left:1px solid #ddd; padding-left:20px;'>");
+  content += F("<b>Raw V:</b> <span id='raw_v'>"); content += String(appCfg.cal_voltage > 0 ? cse_voltage/appCfg.cal_voltage : 0, 2); content += F("</span><br>");
+  content += F("<b>Raw I:</b> <span id='raw_i'>"); content += String(appCfg.cal_current > 0 ? cse_current/appCfg.cal_current : 0, 4); content += F("</span><br>");
+  content += F("<b>Raw P:</b> <span id='raw_p'>"); content += String(appCfg.cal_power > 0 ? cse_power/appCfg.cal_power : 0, 2); content += F("</span></div>");
+
+  content += F("<div style='border-left:1px solid #ddd; padding-left:20px;'>");
   content += F("<b>Factor Tensiune:</b> <span id='f_volt'>"); content += String(appCfg.cal_voltage, 6); content += F("</span><br>");
   content += F("<b>Factor Curent:</b> <span id='f_curr'>"); content += String(appCfg.cal_current, 6); content += F("</span><br>");
   content += F("<b>Factor Putere:</b> <span id='f_pwr'>"); content += String(appCfg.cal_power, 6); content += F("</span></div></div>");
@@ -1135,6 +1392,10 @@ void pageCalibration() {
   content += F("document.getElementById('volt').innerText=p[0];");
   content += F("document.getElementById('curr').innerText=p[1];");
   content += F("document.getElementById('pwr').innerText=p[2];");
+  content += F("if(p.length>12){");
+  content += F("document.getElementById('raw_v').innerText=p[10];");
+  content += F("document.getElementById('raw_i').innerText=p[11];");
+  content += F("document.getElementById('raw_p').innerText=p[12];}");
   content += F("if(p.length>9){");
   content += F("document.getElementById('f_volt').innerText=p[7];");
   content += F("document.getElementById('f_curr').innerText=p[8];");
@@ -1173,13 +1434,19 @@ void pageManualCalibration() {
   String content;
   content.reserve(3000);
   content = F("<h2>Setari Avansate Calibrare</h2>");
-  content += F("<div class='info'><b>Valori Brute (Raw):</b> V:<span id='raw_v'>");
-  content += String(cse_voltage/appCfg.cal_voltage, 2);
-  content += F("</span> | I:<span id='raw_i'>");
-  content += String(cse_current/appCfg.cal_current, 4);
-  content += F("</span> | P:<span id='raw_p'>");
-  content += String(cse_power/appCfg.cal_power, 2);
-  content += F("</span></div>");
+  
+  content += F("<div class='info' style='display:flex; justify-content:space-between; align-items:flex-start;'><div>");
+  content += F("<b>Tensiune:</b> <span id='volt'>"); content += String(cse_voltage, 1); content += F("</span> V<br>");
+  content += F("<b>Curent:</b> <span id='curr'>"); content += String(cse_current, 3); content += F("</span> A<br>");
+  content += F("<b>Putere:</b> <span id='pwr'>"); content += String(cse_power, 1); content += F("</span> W</div>");
+  content += F("<div style='border-left:1px solid #ddd; padding-left:20px;'>");
+  content += F("<b>Raw V:</b> <span id='raw_v'>"); content += String(appCfg.cal_voltage > 0 ? cse_voltage/appCfg.cal_voltage : 0, 2); content += F("</span><br>");
+  content += F("<b>Raw I:</b> <span id='raw_i'>"); content += String(appCfg.cal_current > 0 ? cse_current/appCfg.cal_current : 0, 4); content += F("</span><br>");
+  content += F("<b>Raw P:</b> <span id='raw_p'>"); content += String(appCfg.cal_power > 0 ? cse_power/appCfg.cal_power : 0, 2); content += F("</span></div>");
+  content += F("<div style='border-left:1px solid #ddd; padding-left:20px;'>");
+  content += F("<b>Factor Tensiune:</b> <span id='f_volt'>"); content += String(appCfg.cal_voltage, 6); content += F("</span><br>");
+  content += F("<b>Factor Curent:</b> <span id='f_curr'>"); content += String(appCfg.cal_current, 6); content += F("</span><br>");
+  content += F("<b>Factor Putere:</b> <span id='f_pwr'>"); content += String(appCfg.cal_power, 6); content += F("</span></div></div>");
   
   content += F("<div class='row'><div class='col'><fieldset><legend>Calibrare prin Valori Tinta</legend>");
   content += F("<p><small>Calculati factorii oferind valorile reale.</small></p>");
@@ -1200,10 +1467,18 @@ void pageManualCalibration() {
   content += "<br><a href='/calibration'><button class='secondary'>Inapoi</button></a>";
   
   content += F("<script>setInterval(function(){fetch('/api/sensors').then(r=>r.text()).then(v=>{");
-  content += F("var p=v.split('|');if(p.length>12){");
+  content += F("var p=v.split('|');");
+  content += F("document.getElementById('volt').innerText=p[0];");
+  content += F("document.getElementById('curr').innerText=p[1];");
+  content += F("document.getElementById('pwr').innerText=p[2];");
+  content += F("if(p.length>12){");
   content += F("document.getElementById('raw_v').innerText=p[10];");
   content += F("document.getElementById('raw_i').innerText=p[11];");
   content += F("document.getElementById('raw_p').innerText=p[12];}");
+  content += F("if(p.length>9){");
+  content += F("document.getElementById('f_volt').innerText=p[7];");
+  content += F("document.getElementById('f_curr').innerText=p[8];");
+  content += F("document.getElementById('f_pwr').innerText=p[9];}");
   content += F("});},1000);</script>");
 
   server.send(200, "text/html", renderPage("Manual Cal", content));
@@ -1300,6 +1575,19 @@ void handleSaveTopic() {
   server.send(303);
 }
 
+void handleSaveInterval() {
+  if (!checkAuth(appCfg.auth_config, appCfg.user_config, appCfg.pass_config)) return;
+  if (server.hasArg("interval")) {
+    int val = server.arg("interval").toInt();
+    if (val < 1) val = 1;
+    if (val > 300) val = 300; // Limita extinsa la 5 minute
+    mqttCfg.pub_interval = (uint16_t)val;
+    saveMqttConfig();
+  }
+  server.sendHeader("Location", "/config");
+  server.send(303);
+}
+
 void handleSaveMqttControl() {
   if (!checkAuth(appCfg.auth_config, appCfg.user_config, appCfg.pass_config)) return;
   if (server.hasArg("enabled")) {
@@ -1379,11 +1667,8 @@ void handleTestMqtt() {
 void handleResetStats() {
   if (!checkAuth(appCfg.auth_config, appCfg.user_config, appCfg.pass_config)) return;
   if (server.hasArg("type")) {
-    if (server.arg("type") == "wifi") wifiConnectCount = 0;
-    if (server.arg("type") == "mqtt") mqttConnectCount = 0;
-  } else {
-    wifiConnectCount = 0;
-    mqttConnectCount = 0;
+    if (server.arg("type") == "wifi") wifiDisconnectCount = 0;
+    if (server.arg("type") == "mqtt") mqttDisconnectCount = 0;
   }
   mqttPublishAll();
   server.sendHeader("Location", "/");
@@ -1553,6 +1838,8 @@ void setup() {
   }
 
   wifiConnectHandler = WiFi.onStationModeGotIP([](const WiFiEventStationModeGotIP& event) { wifiConnectCount++; });
+  wifiDisconnectHandler = WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected& event) { wifiDisconnectCount++; });
+  last_mqtt_report_time = millis(); // Initialize reporting timer
 
   if (!connectWiFi()) {
     setupMode = true;
@@ -1694,7 +1981,7 @@ void handlePeriodicUpdates() {
   }
 
   // Protectie Supra-Sarcina Hardware
-  if (cse_power > MAX_POWER_LIMIT) {
+  if (cse_power > MAX_POWER_LIMIT) { // Aici cse_power va ajunge eventual la valoare, ramane ca protectie secundara
     for(int i=0; i<RELAY_COUNT; i++) setRelay(i, false);
     calStatusMsg = "AVARIE: LIMITA PUTERE DEPASITA!";
   }
@@ -1734,6 +2021,13 @@ void loop() {
   if (!setupMode) {
     mqtt.loop();
     mqttConnect();
+    
+    // Monitorizare deconectari MQTT
+    bool currentMqttState = mqtt.connected();
+    if (lastMqttConnectedState && !currentMqttState) {
+        mqttDisconnectCount++;
+    }
+    lastMqttConnectedState = currentMqttState;
   }
 
   // Citire date energie si protectie (ruleaza mereu, chiar si in mod AP)

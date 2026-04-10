@@ -1,4 +1,4 @@
-# NOUS A5T Smart Power Strip - Custom Firmware (v2.7.0)
+# NOUS A5T Smart Power Strip - Custom Firmware (v2.7.1)
 
 Professional-grade custom firmware for the **NOUS A5T Smart Power Strip** (based on the ESP8285 chip). This firmware replaces the stock software to provide enhanced privacy, local control via Web UI/MQTT, and highly accurate energy monitoring.
 

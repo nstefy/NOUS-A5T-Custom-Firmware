@@ -2,7 +2,7 @@
 
 Acest firmware este o soluție personalizată pentru priza inteligentă NOUS A5T, bazată pe platforma ESP8266/ESP8285. Oferă control complet asupra celor 4 relee (inclusiv portul USB), monitorizare a consumului de energie (tensiune, curent, putere, factor de putere) și integrare extinsă cu sisteme de automatizare precum MQTT și Home Assistant.
 
-**Versiune Firmware:** `v2.7.0`
+**Versiune Firmware:** `v2.7.1` (Vezi Changelog)
 
 ## Cuprins
 
@@ -102,6 +102,7 @@ Accesibilă la `/calibration` și `/manual_calibration`.
 *   **Resetare Calibrare:** Resetează factorii de calibrare la valorile implicite din fabrică.
 
 ### Actualizare Firmware (OTA)
+### Actualizare Firmware (OTA)
 Accesibilă la `/update`.
 *   Permite încărcarea unui nou fișier `.bin` pentru a actualiza firmware-ul fără a fi nevoie de o conexiune fizică.
 
@@ -184,4 +185,3 @@ Pe pagina de configurare (`/config`), există butoane pentru a genera fragmente 
 *   **CSE7766:** Comunicarea cu cipul CSE7766 se face prin SoftwareSerial la 4800 baud, 8E1. Se aplică o corecție pentru zgomotul de putere sub 0.1W.
 *   **Protecție Supra-Sarcina:** Dacă puterea măsurată depășește `MAX_POWER_LIMIT` (3680W), toate releele sunt oprite automat, iar un mesaj de avertizare este afișat.
 *   **Reconectare WiFi:** Dispozitivul încearcă să se reconecteze automat la WiFi. Dacă nu reușește timp de 5 minute, activează modul AP de urgență (`NOUS-Setup`).
-
