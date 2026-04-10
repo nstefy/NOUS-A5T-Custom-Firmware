@@ -1,4 +1,4 @@
-# Jurnal de Modificări (Changelog) - NOUS A5T Custom Firmware
+# Changelog - NOUS A5T Custom Firmware
 
 All notable changes to this project will be documented in this file.
 
