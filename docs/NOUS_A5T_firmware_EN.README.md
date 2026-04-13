@@ -1,4 +1,4 @@
-# NOUS A5T Smart Power Strip - Custom Firmware (v2.7.2)
+# NOUS A5T Smart Power Strip - Custom Firmware (v2.7.3)
 
 Professional-grade custom firmware for the **NOUS A5T Smart Power Strip** (based on the ESP8285 chip). This firmware replaces the stock software to provide enhanced privacy, local control via Web UI/MQTT, and highly accurate energy monitoring.
 
@@ -6,6 +6,7 @@ Professional-grade custom firmware for the **NOUS A5T Smart Power Strip** (based
 
 - **Multi-Socket Control**: Independent control for 3 standard AC outlets and 1 USB port.
 - **Advanced Energy Monitoring**: High-precision monitoring of Voltage (V), Current (A), Active Power (W), and Power Factor (PF) via the CSE7766 chipset.
+- **mDNS**: Easy access via unique hostname (e.g., `http://nous-a5t-XXXXXX.local` where XXXXXX is the Chip ID).
 - **Industrial-Grade Reliability**: 
     - **RAM Optimized**: High-efficiency string management ensuring ~25KB free heap.
     - **WiFi Resilience**: Automatic background reconnection and emergency AP fallback (after 5 minutes of disconnect).
@@ -76,6 +77,7 @@ The base topic defaults to `nous`. All command topics expect `ON`/`OFF`, `1`/`0`
 - **Module**: ESP8285 (1MB Flash).
 - **Energy Chip**: CSE7766 (UART @ 4800 baud, 8E1).
 - **Storage**: LittleFS used for configuration persistence.
+- **mDNS**: Reachable via `http://nous-a5t-XXXXXX.local` (mDNS).
 
 ### Performance Optimizations
 - **String Buffering**: Heavy use of `reserve()` and `+=` operator to prevent heap fragmentation.
@@ -84,7 +86,7 @@ The base topic defaults to `nous`. All command topics expect `ON`/`OFF`, `1`/`0`
 
 ## License & Versions
 
-**Current Version**: `2.7.0-EN` (or `2.7.0-RO` for Romanian translation).
+**Current Version**: `2.7.3-EN` (or `2.7.3-RO` for Romanian translation).
 
 *This firmware is provided as-is. Always exercise caution when working with mains voltage.*
 

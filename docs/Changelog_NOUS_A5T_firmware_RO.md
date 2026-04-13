@@ -2,6 +2,11 @@
 
 Toate modificările notabile aduse acestui proiect vor fi documentate în acest fișier.
 
+## [2.7.3] - 2026-04-14
+### Adăugat
+- **Hostname mDNS Unic:** Hostname-ul mDNS implicit include acum automat ID-ul unic al cipului ESP (ex: `nous-a5t-XXXXXX.local`) pentru a preveni conflictele în rețea în prezența mai multor dispozitive.
+- **Migrare Automată:** Dispozitivele care folosesc vechiul hostname static "NOUS-A5T" sunt migrate automat la noul format unic la prima pornire.
+
 ## [2.7.2] - 2026-04-13
 ### Îmbunătățit
 - **Logica de Inițializare (First Boot):** Implementarea utilizării `memset` pentru curățarea structurilor de configurare în RAM la pornire. Această măsură previne utilizarea datelor reziduale "gunoi" care ar putea bloca accesul la dispozitiv pe un cip proaspăt scris.
@@ -43,7 +48,7 @@ Toate modificările notabile aduse acestui proiect vor fi documentate în acest 
 ### Tehnic
 - Utilizarea sistemului de fișiere **LittleFS** pentru stocarea persistentă și atomică a setărilor.
 - Suport pentru actualizări firmware **OTA** (Over-The-Air) cu protecție prin parolă.
-- Implementare mDNS pentru acces facil via `http://nous-a5t.local`.
+- Implementare mDNS pentru acces facil via `http://nous-a5t-XXXXXX.local` (unde XXXXXX este ID-ul unic al cipului).
 
 ## [1.0.0] - Erase/Rescue Bridge
 ### Adăugat

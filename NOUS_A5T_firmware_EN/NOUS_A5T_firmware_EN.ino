@@ -2,7 +2,7 @@
  * Custom Firmware for NOUS A5T (ESP8266 / ESP8285)
  * Based on Tasmota template: {"NAME":"NOUS A5T","GPIO":[0,3072,544,3104,0,259,0,0,225,226,224,0,35,4704],"FLAG":1,"BASE":18}
  */
-#define FW_VERSION "2.7.2-EN"
+#define FW_VERSION "2.7.3-EN"
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -345,10 +345,13 @@ void loadConfig() {
     strlcpy(mqttCfg.client_id, "nous_a5t", sizeof(mqttCfg.client_id));
     strlcpy(mqttCfg.topic, "nous", sizeof(mqttCfg.topic));
     mqttCfg.enabled = false;
-    strlcpy(mqttCfg.mdns_hostname, "NOUS-A5T", sizeof(mqttCfg.mdns_hostname));
+    snprintf(mqttCfg.mdns_hostname, sizeof(mqttCfg.mdns_hostname), "nous-a5t-%06X", ESP.getChipId());
     mqttCfg.pub_interval = 1;
   }
-  if (strlen(mqttCfg.mdns_hostname) == 0) strlcpy(mqttCfg.mdns_hostname, "NOUS-A5T", sizeof(mqttCfg.mdns_hostname));
+  if (strlen(mqttCfg.mdns_hostname) == 0 || strcmp(mqttCfg.mdns_hostname, "NOUS-A5T") == 0) {
+    snprintf(mqttCfg.mdns_hostname, sizeof(mqttCfg.mdns_hostname), "nous-a5t-%06X", ESP.getChipId());
+  }
+
   if (mqttCfg.pub_interval < 1) mqttCfg.pub_interval = 1;
   if (mqttCfg.pub_interval > 300) mqttCfg.pub_interval = 300; // Capped at 5 minutes
 

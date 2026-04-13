@@ -2,7 +2,7 @@
 
 Acest firmware este o soluție personalizată pentru priza inteligentă NOUS A5T, bazată pe platforma ESP8266/ESP8285. Oferă control complet asupra celor 4 relee (inclusiv portul USB), monitorizare a consumului de energie (tensiune, curent, putere, factor de putere) și integrare extinsă cu sisteme de automatizare precum MQTT și Home Assistant.
 
-**Versiune Firmware:** `v2.7.2` (Vezi Changelog)
+**Versiune Firmware:** `v2.7.3` (Vezi Changelog)
 
 ## Cuprins
 
@@ -74,7 +74,7 @@ Dacă dispozitivul nu se poate conecta la rețeaua WiFi configurată (sau dacă 
 
 ## Configurare Web (Mod Normal)
 
-Odată conectat la rețeaua WiFi, dispozitivul va fi accesibil prin adresa IP sau prin hostname-ul mDNS (implicit `http://NOUS-A5T.local`).
+Odată conectat la rețeaua WiFi, dispozitivul va fi accesibil prin adresa IP sau prin hostname-ul mDNS (implicit `http://nous-a5t-XXXXXX.local`).
 
 ### Setări WiFi
 *   Configurația WiFi se face inițial în modul AP.
@@ -83,7 +83,7 @@ Odată conectat la rețeaua WiFi, dispozitivul va fi accesibil prin adresa IP sa
 Accesibilă la `/config`.
 *   **Host, Port, Client ID, User, Pass:** Detalii pentru conexiunea la brokerul MQTT.
 *   **Topic Principal:** Prefixul pentru toate topicurile MQTT (ex: `nous`).
-*   **mDNS Hostname:** Numele sub care dispozitivul va fi vizibil în rețea (ex: `nous-a5t.local`).
+*   **mDNS Hostname:** Numele sub care dispozitivul va fi vizibil în rețea (ex: `nous-a5t-XXXXXX.local`).
 *   **Control MQTT:** Activează/dezactivează funcționalitatea MQTT.
 *   **Retrimite HA Discovery:** Forțează retransmiterea mesajelor de descoperire pentru Home Assistant.
 *   **Generare Config OpenHAB/ESPHome:** Instrumente pentru a genera automat fișiere de configurare pentru aceste platforme.

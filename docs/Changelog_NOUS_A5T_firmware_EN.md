@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.7.3] - 2026-04-14
+### Added
+- **Unique mDNS Hostname:** The default mDNS hostname now automatically includes the unique ESP Chip ID (e.g., `nous-a5t-XXXXXX.local`) to prevent network conflicts when multiple devices are present.
+- **Automatic Migration:** Existing devices using the old static hostname "NOUS-A5T" are automatically migrated to the new unique format.
+
 ## [2.7.2] - 2026-04-13
 ### Improved
 - **Initialization Logic (First Boot):** Implemented `memset` to clear configuration structures in RAM at startup. This prevents "garbage" residual data from potentially locking out a freshly flashed device.
@@ -43,7 +48,7 @@ All notable changes to this project will be documented in this file.
 ### Technical
 - Use of **LittleFS** file system for persistent and atomic settings storage.
 - Support for **OTA** (Over-The-Air) firmware updates with password protection.
-- mDNS implementation for easy access via `http://nous-a5t.local`.
+- mDNS implementation for easy access via `http://nous-a5t-XXXXXX.local` (where XXXXXX is the unique Chip ID).
 
 ## [1.0.0] - Erase/Rescue Bridge
 ### Added
