@@ -4,9 +4,10 @@
 
 This firmware enables **Over-The-Air (OTA)** firmware updates for ESP8266 devices. It creates an access point that allows you to upload new firmware via:
 - **Web browser interface** - Upload `.bin` files directly
-- **Arduino IDE** - Wirelessly via OTA mechanism
 
-This is particularly useful for rescuing devices with corrupted firmware or for convenient remote updates.
+This is particularly useful for rescuing devices with corrupted firmware or for transitioning from other firmwares like Tasmota.
+
+> **Note:** This tool can be uploaded directly via the Tasmota **"Upgrade by File Upload"** option. This is the recommended method for devices with 1MB Flash where space is limited.
 
 ---
 
@@ -14,7 +15,6 @@ This is particularly useful for rescuing devices with corrupted firmware or for 
 
 ✅ **Access Point Mode** - Device becomes a WiFi hotspot  
 ✅ **Web Upload Interface** - Drag-and-drop firmware upload via browser  
-✅ **Arduino IDE OTA Support** - Upload directly from Arduino IDE  
 ✅ **Auto Restart** - Device restarts after successful firmware update  
 ✅ **Error Handling** - Feedback on upload success/failure  
 
@@ -22,9 +22,10 @@ This is particularly useful for rescuing devices with corrupted firmware or for 
 
 ## Hardware Requirements
 
-- **ESP8266** microcontroller (NodeMCU, D1 Mini, or similar)
+- **ESP8266** microcontroller (including ESP8285)
 - USB cable for initial programming
 - WiFi-enabled device (computer, smartphone) for updates
+*Note: The pre-compiled binary provided in this repository is compiled specifically for ESP8285 (1MB Flash).*
 
 ---
 
@@ -49,13 +50,11 @@ This is particularly useful for rescuing devices with corrupted firmware or for 
 Install required libraries via `Sketch → Include Library → Manage Libraries`:
 - **ESP8266WiFi** (built-in)
 - **ESP8266WebServer** (built-in)
-- **ArduinoOTA** (built-in)
 
 ### 3. Upload Initial Firmware
 
 1. Connect ESP8266 to computer via USB
 2. Open `erase_firmware.ino` in Arduino IDE
-3. Select correct COM port: `Tools → Port`
 4. Click **Upload** (→ button)
 
 ---
@@ -76,17 +75,6 @@ Install required libraries via `Sketch → Include Library → Manage Libraries`
    - Click **Upload**
    - Wait for completion (device will auto-restart)
 
-### Method 2: Arduino IDE OTA Update
-
-1. **Prepare New Firmware:**
-   - Open your firmware sketch in Arduino IDE
-   - Select: `Tools → Port → esp-rescue at 192.168.4.xx (network)`
-   - Click **Upload** (→ button)
-
-2. **Monitor Upload:**
-   - Output shows upload progress
-   - Device restarts after completion
-
 ---
 
 ## Configuration
@@ -96,7 +84,6 @@ Edit these lines in the code to customize:
 ```cpp
 const char* AP_SSID = "Firmware_Rescue_AP";    // WiFi network name
 const char* AP_PASS = NULL;                    // Password (NULL = open)
-const char* OTA_HOSTNAME = "esp-rescue";       // Arduino IDE device name
 ```
 
 ---
@@ -114,18 +101,16 @@ const char* OTA_HOSTNAME = "esp-rescue";       // Arduino IDE device name
 
 ### Startup (setup):
 1. Creates an **Access Point** with SSID `Firmware_Rescue_AP`
-2. Initializes **ArduinoOTA** for wireless IDE updates
-3. Starts **Web Server** on port 80 for file-based upload
+2. Starts **Web Server** on port 80 for file-based upload
 
 ### Upload Process:
-1. User uploads `.bin` file or uses Arduino IDE
+1. User uploads `.bin` file via the Web Interface
 2. Firmware is written to flash memory in chunks
 3. Integrity is verified using CRC
 4. Device automatically restarts with new firmware
 
 ### Continuous Operation (loop):
 - Handles incoming web requests
-- Processes ArduinoOTA commands
 
 ---
 
@@ -145,7 +130,6 @@ const char* OTA_HOSTNAME = "esp-rescue";       // Arduino IDE device name
 | **Can't connect to 192.168.4.1** | Make sure you're connected to `Firmware_Rescue_AP` network |
 | **Upload fails** | Try smaller firmware file or check USB power supply |
 | **Device doesn't restart** | Manually press reset button or power cycle |
-| **Arduino IDE can't find device** | Ensure ESP8266 is on same network and `esp-rescue` hostname is accessible |
 
 ---
 
@@ -184,7 +168,6 @@ const char* AP_PASS = "YourPassword";
 - **Flash Memory:** 4MB typical
 - **Update Method:** HTTP POST with multipart/form-data
 - **Restart:** ESP.restart() function
-- **OTA Port:** 8266 (ArduinoOTA standard)
 
 ---
 

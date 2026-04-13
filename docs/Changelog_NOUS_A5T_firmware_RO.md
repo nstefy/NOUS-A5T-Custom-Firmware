@@ -2,6 +2,15 @@
 
 Toate modificările notabile aduse acestui proiect vor fi documentate în acest fișier.
 
+## [2.7.2] - 2026-04-13
+### Îmbunătățit
+- **Logica de Inițializare (First Boot):** Implementarea utilizării `memset` pentru curățarea structurilor de configurare în RAM la pornire. Această măsură previne utilizarea datelor reziduale "gunoi" care ar putea bloca accesul la dispozitiv pe un cip proaspăt scris.
+- **Securitate OTA:** Garantarea faptului că parola implicită "admin" pentru actualizările via IDE este setată și salvată corect chiar și în absența unui fișier de configurare preexistent.
+- **Paritate RO/EN:** Sincronizarea completă a logicii de încărcare a configurației și a întreținerii sistemului de fișiere între versiunile în limba Română și Engleză.
+
+### Remediate (Fixed)
+- Fix pentru instabilitatea Watchdog-ului (WDT) în timpul curățării fișierelor vechi (Tasmota) prin adăugarea apelurilor `yield()`.
+
 ## [2.7.1] - 2026-04-10
 ### Adăugat
 - Buton de testare dinamică a conexiunii MQTT în pagina de configurare (folosind AJAX).

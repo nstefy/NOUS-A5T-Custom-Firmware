@@ -2,7 +2,7 @@
  * Firmware Custom pentru NOUS A5T (ESP8266 / ESP8285)
  * Bazat pe template Tasmota: {"NAME":"NOUS A5T","GPIO":[0,3072,544,3104,0,259,0,0,225,226,224,0,35,4704],"FLAG":1,"BASE":18}
  */
-#define FW_VERSION "2.7.1"
+#define FW_VERSION "2.7.2-RO"
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -323,13 +323,16 @@ void loadConfig() {
     }
   }
 
+  // Inițializăm structurile cu 0 pentru a evita date reziduale din RAM
+  memset(&wifiCfg, 0, sizeof(WifiConfig));
+  memset(&mqttCfg, 0, sizeof(MqttConfig));
+  memset(&appCfg, 0, sizeof(AppConfig));
+
   // WiFi
   if (LittleFS.exists("/wifi.bin")) {
     File f = LittleFS.open("/wifi.bin", "r");
     f.read((uint8_t*)&wifiCfg, sizeof(WifiConfig));
     f.close();
-  } else {
-    memset(&wifiCfg, 0, sizeof(WifiConfig));
   }
 
   // MQTT
@@ -338,11 +341,7 @@ void loadConfig() {
     f.read((uint8_t*)&mqttCfg, sizeof(MqttConfig));
     f.close();
   } else {
-    memset(&mqttCfg, 0, sizeof(MqttConfig));
-    strlcpy(mqttCfg.host, "", sizeof(mqttCfg.host));
     mqttCfg.port = 1883;
-    strlcpy(mqttCfg.user, "", sizeof(mqttCfg.user));
-    strlcpy(mqttCfg.pass, "", sizeof(mqttCfg.pass));
     strlcpy(mqttCfg.client_id, "nous_a5t", sizeof(mqttCfg.client_id));
     strlcpy(mqttCfg.topic, "nous", sizeof(mqttCfg.topic));
     mqttCfg.enabled = false;
@@ -358,22 +357,14 @@ void loadConfig() {
     File f = LittleFS.open("/app.bin", "r");
     f.read((uint8_t*)&appCfg, sizeof(AppConfig));
     f.close();
-  } else {
+  }
+  
+  // Validare configuratie (daca fisierul nu exista sau are structura veche)
+  if (appCfg.magic != CONFIG_MAGIC) {
     appCfg.magic = CONFIG_MAGIC;
     for(int i=0; i<RELAY_COUNT; i++) appCfg.relay_state[i] = false;
     appCfg.child_lock = false;
-    appCfg.power_on_behavior = 2; // Default: Previous
-
-    // VALORI CALIBRARE DEFAULT CONFORM CERINTEI
-    appCfg.cal_voltage = DEFAULT_CAL_V; 
-    appCfg.cal_current = DEFAULT_CAL_I; 
-    appCfg.cal_power = DEFAULT_CAL_P;   
-  }
-  
-  // Validare factori calibrare
-  if (appCfg.magic != CONFIG_MAGIC) {
-    // Daca structura datelor s-a schimbat, resetam factorii la valorile sigure
-    appCfg.magic = CONFIG_MAGIC;
+    
     appCfg.cal_voltage = DEFAULT_CAL_V;
     appCfg.cal_current = DEFAULT_CAL_I;
     appCfg.cal_power = DEFAULT_CAL_P;
@@ -1690,6 +1681,7 @@ void cleanupUnusedFiles() {
     if (cleanName != "wifi.bin" && cleanName != "mqtt.bin" && cleanName != "app.bin") {
       filesToDelete += fileName + "\n";
     }
+    yield();
   }
 
   int p = 0;

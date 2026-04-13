@@ -1,4 +1,4 @@
-# NOUS A5T Smart Power Strip - Custom Firmware (v2.7.0)
+# NOUS A5T Smart Power Strip - Custom Firmware (v2.7.2)
 
 Professional-grade custom firmware for the **NOUS A5T Smart Power Strip** (based on the ESP8285 chip). This firmware replaces the stock software to provide enhanced privacy, local control via Web UI/MQTT, and highly accurate energy monitoring.
 
@@ -12,7 +12,7 @@ Professional-grade custom firmware for the **NOUS A5T Smart Power Strip** (based
     - **Safety First**: Automatic cut-off at **3680W (16A)**.
 - **Smart Home Ready**: 
     - Full MQTT support with Home Assistant Auto-Discovery.
-    - Configuration exporters for OpenHAB and ESPHome.
+    - Built-in configuration exporters for **OpenHAB** and **ESPHome**.
 - **Power-on Behavior**: Configurable startup states: `ALWAYS OFF`, `ALWAYS ON`, or `RESTORE PREVIOUS`.
 - **Physical Security**: "Child Lock" feature to disable physical button interactions.
 - **Web Security**: Multi-tier Basic Authentication for the main dashboard and configuration menus.

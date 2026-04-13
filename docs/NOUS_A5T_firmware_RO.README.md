@@ -2,7 +2,7 @@
 
 Acest firmware este o soluție personalizată pentru priza inteligentă NOUS A5T, bazată pe platforma ESP8266/ESP8285. Oferă control complet asupra celor 4 relee (inclusiv portul USB), monitorizare a consumului de energie (tensiune, curent, putere, factor de putere) și integrare extinsă cu sisteme de automatizare precum MQTT și Home Assistant.
 
-**Versiune Firmware:** `v2.7.1` (Vezi Changelog)
+**Versiune Firmware:** `v2.7.2` (Vezi Changelog)
 
 ## Cuprins
 

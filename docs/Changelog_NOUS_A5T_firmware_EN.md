@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.7.2] - 2026-04-13
+### Improved
+- **Initialization Logic (First Boot):** Implemented `memset` to clear configuration structures in RAM at startup. This prevents "garbage" residual data from potentially locking out a freshly flashed device.
+- **OTA Security:** Guaranteed that the default "admin" password for IDE updates is correctly set and saved even without a pre-existing configuration file.
+- **RO/EN Parity:** Full synchronization of configuration loading and filesystem maintenance logic between Romanian and English versions.
+
+### Fixed
+- Fixed Watchdog Timer (WDT) instability during cleanup of legacy files (Tasmota) by adding `yield()` calls.
+
 ## [2.7.1] - 2026-04-10
 ### Added
 - Dynamic MQTT connection test button in the configuration page (using AJAX).

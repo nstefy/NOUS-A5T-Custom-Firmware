@@ -1,17 +1,17 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
-#include <ArduinoOTA.h>
+#include <LittleFS.h>
 #include <Updater.h>
+#include <EEPROM.h>
 
 // ================= CONFIGURATION =================
 const char* AP_SSID = "Firmware_Rescue_AP";
 const char* AP_PASS = NULL;       // Open network, no password
-const char* OTA_HOSTNAME = "esp-rescue";
 // ===============================================
 
 ESP8266WebServer server(80);
 
-// Web page for firmware upload. We use a raw string literal (R"html(...)html")
+// Web page for firmware upload. Using a raw string literal (R"html(...)html")
 // to write multi-line HTML directly in the code.
 const char* updatePage = R"html(
 <!DOCTYPE html><html><head><meta charset='utf-8'><title>ESP Rescue OTA</title>
@@ -25,17 +25,26 @@ button{width:100%;background-color:#2196F3;color:white;padding:12px;border:none;
 button:hover{background-color:#0b7dda;}
 .info{font-size:14px;color:#555;}
 </style></head><body>
+<h2>ESP Rescue & Erase Tool</h2>
 <div class='card'>
-  <h2>Firmware Update (File)</h2>
-  <p class='info'>Select the .bin file and press 'Upload'. Device will restart automatically.</p>
-  <form method='POST' action='/update' enctype='multipart/form-data'>
-    <input type='file' name='update'>
-    <button type='submit'>Upload</button>
+  <h3>Firmware Update</h3>
+  <form id='u' method='POST' action='/update' enctype='multipart/form-data'>
+    <input type='file' name='update' accept='.bin'>
+    <button type='button' id='b' onclick='up()'>Upload</button>
+    <div style='margin-top:10px; font-size:13px;'>
+      <input type='checkbox' name='nuke' id='nuke'> <label for='nuke'><b>Absolute Wipe</b> (Format Flash + Reset WiFi)</label>
+    </div>
   </form>
-</div>
-<div class='card'>
-  <h2>OTA Update (WiFi)</h2>
-  <p class='info'>Device is visible in Arduino IDE at network port 'esp-rescue'.</p>
+  <script>
+  function up(){
+    var n=document.getElementById('nuke').checked;
+    var f=document.getElementById('u');
+    document.getElementById('b').disabled = true;
+    document.getElementById('b').innerHTML = 'Uploading...';
+    f.action='/update'+(n?'?nuke=1':'');
+    f.submit();
+  }
+  </script>
 </div>
 </body></html>
 )html";
@@ -44,44 +53,43 @@ void setup() {
   // 1. Start Access Point (AP)
   WiFi.softAP(AP_SSID, AP_PASS);
 
-  // 2. Initialize ArduinoOTA (for update from IDE)
-  ArduinoOTA.setHostname(OTA_HOSTNAME);
-  ArduinoOTA.onStart([]() {
-    // No special action needed at start
-  });
-  ArduinoOTA.onEnd([]() {
-    // After update is complete, restart the device
-    ESP.restart();
-  });
-  ArduinoOTA.onError([](ota_error_t error) {
-    // Here OTA errors can be handled if needed
-  });
-  ArduinoOTA.begin();
-
-  // 3. Initialize Web Server (for update via file)
-  
-  // Handler for main page, which displays the upload form
+  // 2. Initialize Web Server (for file-based update)
   server.on("/", HTTP_GET, []() {
     server.send(200, "text/html", updatePage);
   });
 
-  // Handler for upload process. Has two parts:
-  // - a function that executes at the end of upload (to send response and restart)
-  // - a function that executes during upload (to write data to flash)
+  server.on("/info", HTTP_GET, []() {
+    uint32_t max_space = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+    server.send(200, "text/plain", String(max_space / 1024));
+  });
+
   server.on("/update", HTTP_POST, []() {
-    // Send simple response to browser and restart
-    server.send(200, "text/plain", (Update.hasError()) ? "FAILED" : "OK");
-    ESP.restart();
+    bool success = !Update.hasError();
+    if (success) {
+      server.send(200, "text/plain", "OK - Firmware installed. Restarting...");
+      
+      if (server.hasArg("nuke")) {
+        LittleFS.begin();
+        LittleFS.format();
+        EEPROM.begin(512);
+        for (int i = 0; i < 512; i++) EEPROM.write(i, 0xFF);
+        EEPROM.commit();
+        WiFi.disconnect(true);
+        ESP.eraseConfig();
+      }
+      
+      delay(1000);
+      ESP.restart();
+    } else {
+      server.send(200, "text/plain", "ERROR: " + Update.getErrorString());
+    }
   }, []() {
     HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
-      // Start flash write process
       Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000);
     } else if (upload.status == UPLOAD_FILE_WRITE) {
-      // Write file chunks (buffer) to memory
       Update.write(upload.buf, upload.currentSize);
     } else if (upload.status == UPLOAD_FILE_END) {
-      // Finalize writing and verify integrity
       Update.end(true);
     }
   });
@@ -90,7 +98,5 @@ void setup() {
 }
 
 void loop() {
-  // Constantly handle requests from web server and ArduinoOTA
   server.handleClient();
-  ArduinoOTA.handle();
 }
