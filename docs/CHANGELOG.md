@@ -1,7 +1,5 @@
 # Changelog - NOUS A5T Custom Firmware
 
-All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
 ## [3.0.0] - 2024-04-18
 
 ### Refactored
@@ -18,7 +16,6 @@ All notable changes to this project will be documented in this file. This projec
 - **Comprehensive MQTT Discovery**: Added Home Assistant Auto-Discovery for all 4 relays (3 AC + 1 USB) and 5 sensors (V, A, W, PF, Energy).
 
 ### Fixed
-- **Hardcoded Credentials**: Removed legacy hardcoded strings for `DEFAULT_AP_PASS` and fixed an issue where manual overrides in `loadConfigs` were ignored.
 - **Version Parity**: Corrected mismatched version strings across Romanian and English documentation.
 - **Atomic Saves**: Improved LittleFS reliability by ensuring atomic renames for `hwcfg.bin` and `app.bin`.
 
