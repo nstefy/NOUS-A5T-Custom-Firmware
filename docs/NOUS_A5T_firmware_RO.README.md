@@ -44,7 +44,7 @@ Acest firmware este o soluție personalizată pentru priza inteligentă NOUS A5T
 *   **Blocare Butoane (Child Lock):** Opțiune pentru a dezactiva butoanele fizice.
 *   **Comportament la Pornire:** Configurare pentru starea releelor la repornire (OFF, ON, PREVIOUS).
 *   **Securitate:** Autentificare HTTP pentru paginile web și parolă pentru OTA.
-*   **mDNS:** Accesibil prin hostname (ex: `http://nous-a5t.local`).
+*   **mDNS:** Accesibil prin hostname unic (ex: `http://nous-a5t-XXXXXX.local`).
 
 ## Hardware Suportat
 

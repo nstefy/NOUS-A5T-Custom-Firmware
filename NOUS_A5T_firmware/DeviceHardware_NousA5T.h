@@ -33,6 +33,12 @@ public:
     return String(buf);
   }
 
+  String getDefaultHostname() const {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "nous-a5t-%06X", (uint32_t)ESP.getChipId());
+    return String(buf);
+  }
+
   void applyConfigDefaults(AppConfig& appCfg) {
     (void)appCfg;
     cfgChildLock = false;

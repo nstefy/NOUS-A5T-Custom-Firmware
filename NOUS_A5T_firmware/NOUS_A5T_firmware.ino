@@ -278,7 +278,7 @@ void defaultConfigs() {
   mqttCfg.pub_interval = 1;
   strlcpy(mqttCfg.client_id, "esp8266_adv_template", sizeof(mqttCfg.client_id));
   strlcpy(mqttCfg.topic, "esp/device", sizeof(mqttCfg.topic));
-  snprintf(mqttCfg.mdns_hostname, sizeof(mqttCfg.mdns_hostname), "esp-%06X", ESP.getChipId());
+  strlcpy(mqttCfg.mdns_hostname, hw.getDefaultHostname().c_str(), sizeof(mqttCfg.mdns_hostname));
 
   appCfg.magic = CONFIG_MAGIC;
   appCfg.ui_lang = 1;
@@ -385,7 +385,7 @@ void loadConfigs() {
   }
 
   if (strlen(mqttCfg.mdns_hostname) == 0 || !isValidMdnsHostname(String(mqttCfg.mdns_hostname))) {
-    snprintf(mqttCfg.mdns_hostname, sizeof(mqttCfg.mdns_hostname), "esp-%06X", ESP.getChipId());
+    strlcpy(mqttCfg.mdns_hostname, hw.getDefaultHostname().c_str(), sizeof(mqttCfg.mdns_hostname));
   }
   if (strlen(appCfg.setup_ap_pass) < 8 || strlen(appCfg.setup_ap_pass) > 31) {
     strlcpy(appCfg.setup_ap_pass, DEFAULT_AP_PASS, sizeof(appCfg.setup_ap_pass));
