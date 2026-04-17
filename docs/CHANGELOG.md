@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.0.0] - 2024-05-20
+## [3.0.0] - 2024-04-18
 
 ### Refactored
 - **Unified Source Code**: Merged `NOUS_A5T_firmware_EN` and `NOUS_A5T_firmware_RO` into a single, multilingual `NOUS_A5T_firmware` project. 
