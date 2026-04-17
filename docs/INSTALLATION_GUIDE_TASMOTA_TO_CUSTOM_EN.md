@@ -1,6 +1,6 @@
 # Installation Guide: From Tasmota to Custom Firmware (NOUS A5T)
 
-This document describes the procedure for installing the custom firmware v2.7.3 on **NOUS A5T** devices that come with Tasmota pre-installed.
+This document describes the procedure for installing the custom firmware v3.0.0 on **NOUS A5T** devices that come with Tasmota pre-installed.
 
 ## The Space Problem (Flash Limit)
 Because the NOUS A5T uses the **ESP8285 chip with 1MB Flash**, there is insufficient space to directly transition from Tasmota to the complex final firmware. It is necessary to use an intermediate "minimal" (Erase/Rescue) firmware that serves as a bridge.
@@ -17,7 +17,7 @@ Because the NOUS A5T uses the **ESP8285 chip with 1MB Flash**, there is insuffic
 ## Step 1: Prepare the Files
 To begin, ensure you have the two necessary binary files available:
 - `Erase_Firmware.bin` (The intermediate "rescue" firmware)
-- `NOUS_A5T_firmware.bin` (The final v2.7.3 firmware for NOUS A5T)
+- `NOUS_A5T_firmware.bin` (The final v3.0.0 firmware for NOUS A5T)
 
 *Note: These files are already compiled and ready for use. Manual compilation is not required if you already have them. Make sure the `NOUS_A5T_firmware.bin` file is accessible from the device (phone or PC) you will use to connect to the `Firmware_Rescue_AP` network in Step 3.*
 
@@ -43,14 +43,14 @@ To begin, ensure you have the two necessary binary files available:
 
 ## Step 4: Initial Configuration (Custom Firmware)
 After restarting, the device will enter the configuration mode specific to the NOUS firmware:
-1. Connect to the `NOUS-Setup` WiFi network.
+1. Connect to the `NOUS-Setup-XXXXXX` WiFi network (where XXXXXX is the unique Chip ID).
 2. Access `http://192.168.4.1`.
 3. Configure your home WiFi credentials.
 4. After saving, the device will be accessible at `http://nous-a5t-XXXXXX.local` (where XXXXXX is the unique Chip ID) (mDNS).
 
 ---
 
-## Final Firmware Features (v2.7.0)
+## Final Firmware Features (v3.0.0)
 - **Multi-Socket Control**: 3 AC outlets + 1 USB port (independent).
 - **Energy Monitoring**: Voltage (V), Current (A), Power (W), and Power Factor (PF) via CSE7766.
 - **Protection**: Automatic shutdown if power exceeds **3680W (16A)**.

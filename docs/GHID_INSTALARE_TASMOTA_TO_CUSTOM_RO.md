@@ -1,6 +1,6 @@
 # Ghid de Instalare: De la Tasmota la Custom Firmware (NOUS A5T)
 
-Acest document descrie procedura de instalare a firmware-ului custom v2.7.3 pe dispozitivele **NOUS A5T** care vin cu Tasmota preinstalat. 
+Acest document descrie procedura de instalare a firmware-ului custom v3.0.0 pe dispozitivele **NOUS A5T** care vin cu Tasmota preinstalat. 
 
 ## Problema Spațiului (Flash Limit)
 Deoarece NOUS A5T utilizează cipul **ESP8285 cu 1MB Flash**, spațiul este insuficient pentru a face trecerea directă de la Tasmota la firmware-ul final complex. Este necesară utilizarea unui firmware intermediar „minimal” (Erase/Rescue) care servește drept punte.
@@ -9,7 +9,7 @@ Deoarece NOUS A5T utilizează cipul **ESP8285 cu 1MB Flash**, spațiul este insu
 
 ## Fluxul de Lucru (Workflow)
 1. **Tasmota UI** ➔ Încărcare `Erase_Firmware.bin`
-2. **Erase/Rescue AP** ➔ Încărcare `NOUS_A5T_firmware_v2.7.0.bin`
+2. **Erase/Rescue AP** ➔ Încărcare `NOUS_A5T_firmware.bin`
 3. **Final Setup** ➔ Configurare WiFi și MQTT
 
 ---
@@ -17,7 +17,7 @@ Deoarece NOUS A5T utilizează cipul **ESP8285 cu 1MB Flash**, spațiul este insu
 ## Pasul 1: Pregătirea Fișierelor
 Pentru a începe, asigurați-vă că aveți la dispoziție cele două fișiere binare necesare:
 - `Erase_Firmware.bin` (Firmware-ul intermediar de "rescue")
-- `NOUS_A5T_firmware.bin` (Firmware-ul final v2.7.3 pentru NOUS A5T)
+- `NOUS_A5T_firmware.bin` (Firmware-ul final v3.0.0 pentru NOUS A5T)
 
 
 *Notă: Aceste fișiere sunt deja compilate și gata de utilizare. Nu este necesară compilarea lor manuală dacă le aveți deja. Asigurați-vă că fișierul `NOUS_A5T_firmware.bin` este accesibil de pe dispozitivul (telefon sau PC) pe care îl veți folosi pentru a vă conecta la rețeaua `Firmware_Rescue_AP` în Pasul 3.*
@@ -44,14 +44,14 @@ Pentru a începe, asigurați-vă că aveți la dispoziție cele două fișiere b
 
 ## Pasul 4: Configurarea Inițială (Custom Firmware)
 După restart, dispozitivul va intra în modul de configurare specific firmware-ului NOUS:
-1. Conectați-vă la rețeaua WiFi `NOUS-Setup`.
+1. Conectați-vă la rețeaua WiFi `NOUS-Setup-XXXXXX` (unde XXXXXX este ID-ul unic al cipului).
 2. Accesați `http://192.168.4.1`.
 3. Configurați credențialele WiFi ale casei dumneavoastră.
 4. După salvare, dispozitivul va fi accesibil la adresa `http://nous-a5t-XXXXXX.local` (unde XXXXXX este ID-ul unic al cipului) (mDNS).
 
 ---
 
-## Caracteristici Firmware Final (v2.7.0)
+## Caracteristici Firmware Final (v3.0.0)
 - **Control Multi-Socket**: 3 prize AC + 1 port USB (independent).
 - **Monitorizare Energie**: Tensiune (V), Curent (A), Putere (W) și Factor de Putere (PF) via CSE7766.
 - **Protecție**: Oprire automată la depășirea puterii de **3680W (16A)**.
