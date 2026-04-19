@@ -1202,13 +1202,13 @@ public:
   String renderMainPageFrame(const char* /*fwVersion*/, const String& /*ip*/, int /*rssi*/, bool /*mqttConnected*/, const AppConfig& appCfg) const {
     (void)appCfg;
     String h;
-    h.reserve(2400);
+    h.reserve(3000);
 
     h += F("<div class='card'><h2>"); h += (appCfg.ui_lang == 0 ? F("Controale Hardware") : F("Hardware Controls")); h += F("</h2>");
 
     h += renderRelayGrid(appCfg);
 
-    h += F("<div style='display:grid;grid-template-columns:1fr 1.5fr;gap:8px;margin:0 0 12px 0'>");
+    h += F("<div style='display:grid;grid-template-columns:1fr 1.5fr;gap:8px;margin-bottom:12px'>");
     
     // Child Lock
     h += F("<button id='btn_lock' type='button' onclick='hCmd(\"/toggle_child_lock\",\"\")' style='width:100%;padding:10px;border:0;border-radius:6px;font-weight:600;color:#fff;background:");
@@ -1227,20 +1227,19 @@ public:
       }
       h += F("'>"); h += pobLabels[i]; h += F("</button>");
     }
-    h += F("</div></div>");
+    h += F("</div></div>"); // Închide div-ul flex al POB și div-ul Grid (1fr 1.5fr)
 
     h += renderSensorStats(appCfg);
 
-    h += F("</div>");
+    h += F("</div>"); // Închide .card principal
     return h;
   }
 
   String renderSensorStats(const AppConfig& appCfg) const {
     SensorSnapshot s = readSensors();
     String h;
-    h.reserve(1000);
-    h += F("<div style='margin-top:10px'><h2 style='margin-top:0'>"); h += (appCfg.ui_lang == 0 ? F("Senzori Consum") : F("Power Sensors")); h += F("</h2>");
-    h += F("<div style='display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px'>");
+    h += F("<div style='display:block;clear:both;margin-top:12px;width:100%'><h2 style='margin:0 0 8px 0'>"); h += (appCfg.ui_lang == 0 ? F("Senzori Consum") : F("Power Sensors")); h += F("</h2>");
+    h += F("<div style='display:grid;grid-template-columns:repeat(3,1fr);gap:8px;width:100%'>");
 
     appendSensorBox(h, (appCfg.ui_lang == 0 ? F("Tensiune") : F("Voltage")), F("val_v"), String(s.voltage, 1) + F(" V"));
     appendSensorBox(h, (appCfg.ui_lang == 0 ? F("Curent") : F("Current")), F("val_i"), String(s.current, 3) + F(" A"));
@@ -1248,7 +1247,7 @@ public:
     appendSensorBox(h, (appCfg.ui_lang == 0 ? F("Factor putere") : F("Power Factor")), F("val_pf"), String(s.pf, 3));
     appendSensorBox(h, (appCfg.ui_lang == 0 ? F("Energie") : F("Energy")), F("val_e"), String(s.energy, 4) + F(" kWh"), true);
 
-    h += F("<button type='button' onclick='if(confirm(\"Reset?\"))hCmd(\"/reset_energy\",\"\")' style='width:100%;height:100%;padding:4px 0;border:0;border-radius:6px;background:#dc3545;color:#fff;font-weight:600;font-size:11px;cursor:pointer'>"); h += (appCfg.ui_lang == 0 ? F("RESET<br>ENERG.") : F("RESET<br>ENERGY")); h += F("</button>");
+    h += F("<button type='button' onclick='if(confirm(\"Reset?\"))hCmd(\"/reset_energy\",\"\")' style='width:100%;height:100%;padding:8px;border:0;border-radius:6px;background:#dc3545;color:#fff;font-weight:600;font-size:12px;line-height:1.1;cursor:pointer;display:flex;flex-direction:column;justify-content:center;align-items:center;margin:0'>"); h += (appCfg.ui_lang == 0 ? F("RESET<br>ENERG.") : F("RESET<br>ENERGY")); h += F("</button>");
     h += F("</div></div>");
     return h;
   }
@@ -1256,7 +1255,7 @@ public:
   String renderRelayGrid(const AppConfig& appCfg) const {
     String h;
     h.reserve(1200);
-    h += F("<div style='display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:10px 0 14px 0;'>");
+    h += F("<div style='display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:8px 0;'>");
     for (int i = 0; i < DEVICE_RELAY_COUNT; i++) {
       bool on = cfgRelayState[i];
       h += F("<button id='btn_r"); h += i;
