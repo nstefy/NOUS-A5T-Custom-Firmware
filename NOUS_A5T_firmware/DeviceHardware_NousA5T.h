@@ -2,12 +2,17 @@
 
 #include <LittleFS.h>
 #include <SoftwareSerial.h>
+#include <ArduinoJson.h>
+
+extern unsigned long wifiConnectCount;
+extern unsigned long mqttConnectCount;
 
 #define DEVICE_RELAY_COUNT 4
 #define DEVICE_MODEL       "Nous A5T"
 #define DEFAULT_AP_SSID    "NOUS-Setup"
 #define DEFAULT_AP_PASS    "noussetup"
-#define FW_VERSION_NUMBER  "3.0.0"
+#define DEFAULT_MQTT_PREFIX "nous"
+#define FW_VERSION_NUMBER  "3.0.1"
 #define FW_VERSION_FULL    DEVICE_MODEL " v." FW_VERSION_NUMBER
 
 struct SensorSnapshot {
@@ -37,6 +42,16 @@ public:
     char buf[32];
     snprintf(buf, sizeof(buf), "nous-a5t-%06X", (uint32_t)ESP.getChipId());
     return String(buf);
+  }
+
+  String getDefaultMqttClientId() const {
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%s-%06X", DEFAULT_MQTT_PREFIX, (uint32_t)ESP.getChipId());
+    return String(buf);
+  }
+
+  String getDefaultTopic() const {
+    return getDefaultHostname();
   }
 
   void applyConfigDefaults(AppConfig& appCfg) {
@@ -116,6 +131,28 @@ public:
     publishAll = false;
     publishIdx = -1;
 
+    // Suport pentru comenzi JSON (similar cu Zemismart)
+    if (sub == "/command") {
+      StaticJsonDocument<512> doc;
+      if (deserializeJson(doc, msg) == DeserializationError::Ok) {
+        bool changed = false;
+        for (int i = 0; i < DEVICE_RELAY_COUNT; i++) {
+          String key = "relay" + String(i);
+          if (doc.containsKey(key)) {
+            bool s = (doc[key] == "ON" || doc[key] == 1 || doc[key] == true);
+            setRelay(i, s);
+            cfgRelayState[i] = s;
+            changed = true;
+          }
+        }
+        if (changed) {
+          markHwCfgDirty();
+          publishAll = true;
+          return true;
+        }
+      }
+    }
+
     if (sub == "/relay/all/set") {
       bool s;
       if (!parseOnOff(msg, s)) return false;
@@ -144,52 +181,6 @@ public:
     return false;
   }
 
-  void publishCoreDiscovery(PubSubClient& mqttClient, const MqttConfig& mqttCfg, const String& mac, const char* fwVersion) const {
-    if (!mqttClient.connected()) return;
-
-    for (int i = 0; i < DEVICE_RELAY_COUNT; i++) {
-      String topic = "homeassistant/switch/" + mac + "/relay_" + String(i) + "/config";
-      String payload;
-      payload.reserve(512);
-      payload += F("{\"name\":\"Relay "); payload += (i + 1);
-      payload += F("\",\"uniq_id\":\""); payload += mac; payload += F("_relay_"); payload += i;
-      payload += F("\",\"stat_t\":\""); payload += mqttCfg.topic; payload += F("/relay/"); payload += i;
-      payload += F("\",\"cmd_t\":\""); payload += mqttCfg.topic; payload += F("/relay/"); payload += i; payload += F("/set\"");
-      payload += F(",\"pl_on\":\"ON\",\"pl_off\":\"OFF\"");
-      payload += F(",\"dev\":{\"ids\":[\""); payload += mac;
-      payload += F("\"],\"name\":\"NOUS A5T\",\"mf\":\"NOUS\",\"mdl\":\"A5T\",\"sw\":\""); payload += fwVersion;
-      payload += F("\",\"avty_t\":\""); payload += mqttCfg.topic; payload += F("/status\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\"}}");
-      mqttClient.publish(topic.c_str(), payload.c_str(), true);
-    }
-
-    const char* sensorNames[]      = {"voltage", "current", "power", "pf", "energy"};
-    const char* sensorUnits[]      = {"V", "A", "W", "", "kWh"};
-    const char* sensorClasses[]    = {"voltage", "current", "power", "power_factor", "energy"};
-    const char* sensorStateClass[] = {"", "", "measurement", "", "total_increasing"};
-
-    for (int i = 0; i < 5; i++) {
-      String topic = "homeassistant/sensor/" + mac + "/" + sensorNames[i] + "/config";
-      String payload;
-      payload.reserve(512);
-      payload += F("{\"name\":\""); payload += sensorNames[i]; payload += F("\"");
-      payload += F(",\"uniq_id\":\""); payload += mac; payload += "_"; payload += sensorNames[i]; payload += F("\"");
-      payload += F(",\"stat_t\":\""); payload += mqttCfg.topic; payload += F("/sensors\"");
-      payload += F(",\"val_tpl\":\"{{ value_json."); payload += sensorNames[i]; payload += F(" }}\"");
-      if (strlen(sensorUnits[i]) > 0) {
-        payload += F(",\"unit_of_meas\":\""); payload += sensorUnits[i]; payload += F("\"");
-      }
-      if (strlen(sensorClasses[i]) > 0) {
-        payload += F(",\"dev_cla\":\""); payload += sensorClasses[i]; payload += F("\"");
-      }
-      if (strlen(sensorStateClass[i]) > 0) {
-        payload += F(",\"stat_cla\":\""); payload += sensorStateClass[i]; payload += F("\"");
-      }
-      payload += F(",\"dev\":{\"ids\":[\""); payload += mac;
-      payload += F("\"],\"name\":\"NOUS A5T\",\"sw\":\""); payload += fwVersion; payload += F("\",\"avty_t\":\""); payload += mqttCfg.topic; payload += F("/status\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\"}}");
-      mqttClient.publish(topic.c_str(), payload.c_str(), true);
-    }
-  }
-
   void processRuntimeEvents(AppConfig& appCfg, wl_status_t wifiStatus, bool& requestFactoryReset, bool& stateChanged) {
     (void)appCfg;
     requestFactoryReset = false;
@@ -206,6 +197,19 @@ public:
     if (consumeFactoryResetEvent() && allowFactoryReset(appCfg, wifiStatus)) {
       requestFactoryReset = true;
       return;
+    }
+
+    // Power Balancing (Management termic WiFi)
+    static unsigned long lastPowerBalance = 0;
+    if (wifiStatus == WL_CONNECTED && millis() - lastPowerBalance > 300000) {
+      lastPowerBalance = millis();
+      int32_t rssi = WiFi.RSSI();
+      float targetPower = 17.5f;
+      if (rssi > -55) targetPower = 12.0f; // Semnal bun, reducem puterea pentru a scadea temperatura
+      else if (rssi < -75) targetPower = 20.5f; // Semnal slab, crestem puterea
+      WiFi.setOutputPower(targetPower);
+      
+      WiFi.setSleepMode(rssi < -82 ? WIFI_NONE_SLEEP : WIFI_LIGHT_SLEEP);
     }
 
     if (isInputLocked(appCfg)) return;
@@ -239,7 +243,7 @@ public:
 
   bool allowFactoryReset(const AppConfig& appCfg, wl_status_t wifiStatus) const {
     (void)appCfg;
-    return !cfgChildLock && wifiStatus != WL_CONNECTED;
+    return !cfgChildLock; // Permite resetarea chiar dacă este conectat la WiFi
   }
 
   // Shared helper used by active hardware-rendered UI blocks
@@ -359,9 +363,9 @@ public:
   }
 
   void resetCalibrationDefaults() {
-    calV = 2.38f;
-    calI = 0.93f;
-    calP = 2.51f;
+    calV = DEFAULT_CAL_V;
+    calI = DEFAULT_CAL_I;
+    calP = DEFAULT_CAL_P;
     calibrating = false;
     calibrationStatus = F("Calibration reset");
     markHwCfgDirty();
@@ -418,8 +422,8 @@ public:
     char payload[256];
     snprintf(topic, sizeof(topic), "%s/sensors", mqttCfg.topic);
     snprintf(payload, sizeof(payload),
-             "{\"voltage\":%.2f,\"current\":%.3f,\"power\":%.2f,\"pf\":%.3f,\"energy\":%.4f}",
-             s.voltage, s.current, s.power, s.pf, s.energy);
+             "{\"voltage\":%.2f,\"current\":%.3f,\"power\":%.2f,\"pf\":%.3f,\"energy\":%.4f,\"rssi\":%d,\"uptime\":%lu}",
+             s.voltage, s.current, s.power, s.pf, s.energy, WiFi.RSSI(), millis()/1000);
     mqttClient.publish(topic, payload, true);
 
     snprintf(topic, sizeof(topic), "%s/voltage", mqttCfg.topic);
@@ -445,41 +449,31 @@ public:
     publishExtraState(mqttClient, mqttCfg, appCfg);
   }
 
-  void publishAllState(PubSubClient& mqttClient, const MqttConfig& mqttCfg, const AppConfig& appCfg) const {
-    for (int i = 0; i < DEVICE_RELAY_COUNT; i++) {
-      publishRelayState(mqttClient, mqttCfg, appCfg, i);
-    }
-    publishSensorsState(mqttClient, mqttCfg, appCfg);
-  }
-
-  void publishExtraDiscovery(PubSubClient& mqttClient, const String& mac, const MqttConfig& mqttCfg) const {
+  void publishAllState(PubSubClient& mqttClient, const MqttConfig& mqttCfg, const AppConfig& appCfg, int filter = -2) const {
     if (!mqttClient.connected()) return;
 
-    {
-      String topic = "homeassistant/switch/" + mac + "/child_lock/config";
-      String payload;
-      payload.reserve(420);
-      payload += F("{\"name\":\"Child Lock\",\"uniq_id\":\""); payload += mac; payload += F("_child_lock\"");
-      payload += F(",\"stat_t\":\""); payload += mqttCfg.topic; payload += F("/child_lock\"");
-      payload += F(",\"cmd_t\":\""); payload += mqttCfg.topic; payload += F("/child_lock/set\"");
-      payload += F(",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"icon\":\"mdi:lock\"");
-      payload += F(",\"avty_t\":\""); payload += mqttCfg.topic; payload += F("/status\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\"");
-      payload += F(",\"dev\":{\"ids\":[\""); payload += mac; payload += F("\"],\"name\":\"NOUS A5T\"}}");
-      mqttClient.publish(topic.c_str(), payload.c_str(), true);
+    // filter: -2 = All, -1 = Sensors only, 0-3 = Specific Relay
+    if (filter == -2 || (filter >= 0 && filter < DEVICE_RELAY_COUNT)) {
+      for (int i = 0; i < DEVICE_RELAY_COUNT; i++) {
+        if (filter == -2 || filter == i) publishRelayState(mqttClient, mqttCfg, appCfg, i);
+      }
     }
 
-    {
-      String topic = "homeassistant/select/" + mac + "/power_on_behavior/config";
-      String payload;
-      payload.reserve(460);
-      payload += F("{\"name\":\"Power On Behavior\",\"uniq_id\":\""); payload += mac; payload += F("_power_on\"");
-      payload += F(",\"stat_t\":\""); payload += mqttCfg.topic; payload += F("/power_on_behavior\"");
-      payload += F(",\"cmd_t\":\""); payload += mqttCfg.topic; payload += F("/power_on_behavior/set\"");
-      payload += F(",\"options\":[\"OFF\",\"ON\",\"PREVIOUS\"],\"icon\":\"mdi:power-settings\"");
-      payload += F(",\"avty_t\":\""); payload += mqttCfg.topic; payload += F("/status\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\"");
-      payload += F(",\"dev\":{\"ids\":[\""); payload += mac; payload += F("\"],\"name\":\"NOUS A5T\"}}");
-      mqttClient.publish(topic.c_str(), payload.c_str(), true);
+    if (filter == -2 || filter == -1) {
+      publishSensorsState(mqttClient, mqttCfg, appCfg);
     }
+  }
+
+  void sendConfigPage(ESP8266WebServer& server, const AppConfig& appCfg, const char* title, const String& content) const {
+    String h;
+    h.reserve(content.length() + 1500);
+    h += F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>");
+    h += title; h += F("</title><style>body{font-family:sans-serif;background:#f4f4f4;margin:20px;color:#333}.card{background:#fff;border-radius:8px;padding:20px;margin-bottom:20px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}h2{margin-top:0;color:#0d6efd;font-size:1.1rem;border-bottom:1px solid #eee;padding-bottom:8px}pre{background:#f8f9fa;padding:12px;border:1px solid #ddd;border-radius:4px;overflow-x:auto;font-size:13px;white-space:pre-wrap;word-break:break-all}a{text-decoration:none;color:#666;font-size:14px}</style></head><body>");
+    h += F("<a href='/config'>&larr; "); h += (appCfg.ui_lang == 0 ? F("Inapoi") : F("Back")); h += F("</a>");
+    h += F("<h1>"); h += title; h += F("</h1>");
+    h += content;
+    h += F("</body></html>");
+    server.send(200, "text/html", h);
   }
 
   void subscribeExtraTopics(PubSubClient& mqttClient, const MqttConfig& mqttCfg) const {
@@ -679,31 +673,17 @@ public:
   String renderCalibrationPage(const AppConfig& appCfg) const {
     String c;
     c.reserve(4500);
-    c += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
-    c += F("<title>"); c += (appCfg.ui_lang == 0 ? F("Calibrare") : F("Calibration")); c += F("</title>");
-    c += F("<style>");
-    c += F("body{font-family:sans-serif;background:#f4f4f4;margin:20px;color:#333}");
-    c += F(".container{max-width:900px;margin:0 auto}");
-    c += F(".grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px}");
-    c += F(".card{background:#fff;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}");
-    c += F("h2{margin-top:0;font-size:1.1rem;color:#0d6efd;border-bottom:1px solid #eee;padding-bottom:8px}");
-    c += F("p{margin:10px 0;font-size:14px}b{color:#555}");
+    // Stiluri specifice paginii de calibrare (consolidate)
+    c += F("<style>.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px}p{margin:10px 0;font-size:14px}b{color:#555}");
     c += F("input{width:100%;padding:8px;margin:5px 0;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}");
     c += F("button{width:100%;padding:10px;background:#0d6efd;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;margin-top:10px}");
-    c += F("button.secondary{background:#6c757d}button:hover{opacity:0.9}");
-    c += F(".val-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}");
-    c += F(".val-row input{flex:1;margin-right:10px;margin-top:0}");
-    c += F(".val-row button{width:auto;margin-top:0;padding:8px 15px}");
-    c += F("nav{margin-bottom:20px}nav a{text-decoration:none;color:#666;font-size:14px}");
-    c += F("@media(max-width:700px){.grid{grid-template-columns:1fr}}");
-    c += F("</style></head><body><div class='container'>");
-    c += F("<nav><a href='/config'>&larr; "); c += (appCfg.ui_lang == 0 ? F("Înapoi") : F("Back")); c += F("</a></nav>");
-    c += F("<h1>"); c += (appCfg.ui_lang == 0 ? F("Gestiune Calibrare") : F("Calibration Management")); c += F("</h1>");
+    c += F("button.secondary{background:#6c757d}button:hover{opacity:0.9}.val-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}");
+    c += F(".val-row input{flex:1;margin-right:10px;margin-top:0}.val-row button{width:auto;margin-top:0;padding:8px 15px}");
+    c += F("@media(max-width:700px){.grid{grid-template-columns:1fr}}</style>");
+
     c += F("<div class='grid'>");
     c += F("<div class='card'><h2>"); c += (appCfg.ui_lang == 0 ? F("Valori Brute (Live)") : F("Raw Values (Live)")); c += F("</h2>");
-    c += F("<p><b>V:</b> <span id='rv'>"); c += String(getRawVoltage(), 3); c += F("</span></p>");
-    c += F(" <p><b>I:</b> <span id='ri'>"); c += String(getRawCurrent(), 5); c += F("</span></p>");
-    c += F(" <p><b>P:</b> <span id='rp'>"); c += String(getRawPower(), 3); c += F("</span></p>");
+    c += F("<p><b>V:</b> <span id='rv'>-</span></p><p><b>I:</b> <span id='ri'>-</span></p><p><b>P:</b> <span id='rp'>-</span></p>");
     c += F("<p><small>"); c += (appCfg.ui_lang == 0 ? F("Status: ") : F("Status: ")); c += calibrationStatus; c += F("</small></p></div>");
     c += F("<div class='card'><h2>"); c += (appCfg.ui_lang == 0 ? F("Factori Activi") : F("Current Factors")); c += F("</h2>");
     c += F("<p><b>Factor V:</b> "); c += String(calV, 6); c += F("</p>");
@@ -732,7 +712,6 @@ public:
     c += F("document.getElementById('rv').innerText=d.raw.v;document.getElementById('ri').innerText=d.raw.i;document.getElementById('rp').innerText=d.raw.p;");
     c += F("}}catch(e){}};ws.onclose=schedule;ws.onerror=function(){try{ws.close();}catch(e){}};}");
     c += F("function schedule(){if(rt)return;rt=setTimeout(function(){rt=null;connect();},1000);}connect();})();</script>");
-    c += F("</div></body></html>");
     return c;
   }
 
@@ -762,15 +741,11 @@ public:
     String s;
     s += F("window.hCmd=function(u,p){fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});};");
     s += F("function updateHardwareUI(d){");
-    s += F("if(d.relays){for(let i=0;i<d.relays.length;i++){let b=document.getElementById('btn_r'+i);let st=document.getElementById('stat_r'+i);if(b&&st){b.style.background=d.relays[i]?'#198754':'#6c757d';st.innerText=d.relays[i]?'ON':'OFF';}}} ");
+    s += F("if(d.relays){for(let i=0;i<d.relays.length;i++){let b=document.getElementById('btn_r'+i);let st=document.getElementById('stat_r'+i);if(b&&st){b.style.background=d.relays[i]?'#198754':'#6c757d';st.innerText=d.relays[i]?'ON':'OFF';st.style.color='#fff';}}} ");
     s += F("if(d.sensors){document.getElementById('val_v').innerText=d.sensors.v+' V';document.getElementById('val_i').innerText=d.sensors.i+' A';document.getElementById('val_p').innerText=d.sensors.p+' W';document.getElementById('val_pf').innerText=d.sensors.pf;document.getElementById('val_e').innerText=d.sensors.e+' kWh';}");
-    s += F("if(d.lock!==undefined){let b=document.getElementById('btn_lock');let st=document.getElementById('stat_lock');if(b&&st){b.style.background=d.lock?'#dc3545':'#198754';st.innerText=d.lock?'ON':'OFF';}}");
+    s += F("if(d.lock!==undefined){let b=document.getElementById('btn_lock');let st=document.getElementById('stat_lock');if(b&&st){b.style.background=d.lock?'#dc3545':'#198754';st.innerText=d.lock?'ON':'OFF';st.style.color='#fff';}}");
     s += F("if(d.pob!==undefined){for(let i=0;i<3;i++){let b=document.getElementById('btn_pob_'+i);if(b){b.style.background=(d.pob==i)?'#0d6efd':'#fff';b.style.color=(d.pob==i)?'#fff':'#333';}}}}");
     return s;
-  }
-
-  String renderManualCalibrationPage(const AppConfig& appCfg) const {
-    return renderCalibrationPage(appCfg);
   }
 
   bool consumeRelayToggleEvent(int& relayIdxOut) {
@@ -883,7 +858,7 @@ private:
     if (r != sizeof(blob)) return;
     if (blob.magic != HWCFG_MAGIC || blob.version != HWCFG_VERSION) return;
 
-    uint32_t crc = hwCfgCrc32((const uint8_t*)&blob, sizeof(HwCfgBlob) - sizeof(blob.crc));
+    uint32_t crc = hwCfgCrc32((const uint8_t*)&blob, sizeof(HwCfgBlob) - sizeof(uint32_t));
     if (crc != blob.crc) return;
 
     for (int i = 0; i < DEVICE_RELAY_COUNT; i++) cfgRelayState[i] = blob.relay_state[i];
@@ -934,6 +909,14 @@ private:
       return true;
     }
     return false;
+  }
+
+  void appendSensorBox(String& h, const String& label, const String& id, const String& value, bool highlight = false) const {
+    h += F("<div style='text-align:center;padding:8px;background:");
+    h += (highlight ? F("#e8f5e9") : F("#f8f9fa"));
+    h += F(";border-radius:6px'><small style='color:#666'>");
+    h += label;
+    h += F("</small><br><b id='"); h += id; h += F("'>"); h += value; h += F("</b></div>");
   }
 
   static const int RELAY_PINS[DEVICE_RELAY_COUNT];
@@ -1221,26 +1204,9 @@ public:
     String h;
     h.reserve(2400);
 
-    h += F("<div class='card'>");
-    h += F("<h2>"); h += (appCfg.ui_lang == 0 ? F("Controale Hardware") : F("Hardware Controls")); h += F("</h2>");
+    h += F("<div class='card'><h2>"); h += (appCfg.ui_lang == 0 ? F("Controale Hardware") : F("Hardware Controls")); h += F("</h2>");
 
-    h += F("<div style='display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:10px 0 14px 0;'>");
-    for (int i = 0; i < DEVICE_RELAY_COUNT; i++) {
-      bool on = cfgRelayState[i];
-      h += F("<button id='btn_r"); h += i; h += F("' type='button' onclick='hCmd(\"/toggle\",\"id="); h += i; h += F("\")' style='width:100%;padding:12px;border:0;border-radius:6px;font-weight:600;color:#fff;background:");
-      h += (on ? F("#198754") : F("#6c757d"));
-      h += F("'>");
-      if (i < 3) {
-        h += (appCfg.ui_lang == 0 ? F("Priză ") : F("Socket "));
-        h += (i + 1);
-      } else {
-        h += F("USB");
-      }
-      h += F("<br><small id='stat_r"); h += i; h += F("'>"); h += (on ? F("ON") : F("OFF")); h += F("</small>");
-      h += F("</button>");
-    }
-    h += F("<button type='button' onclick='hCmd(\"/toggle_all\",\"\")' style='width:100%;padding:12px;border:0;border-radius:6px;background:#0d6efd;color:#fff;font-weight:600'>ALL</button>");
-    h += F("</div>");
+    h += renderRelayGrid(appCfg);
 
     h += F("<div style='display:grid;grid-template-columns:1fr 1.5fr;gap:8px;margin:0 0 12px 0'>");
     
@@ -1263,20 +1229,45 @@ public:
     }
     h += F("</div></div>");
 
-    // Sensors + energy card
-    SensorSnapshot s = readSensors();
-    h += F("<div style='margin-top:10px'>");
-    h += F("<h2 style='margin-top:0'>"); h += (appCfg.ui_lang == 0 ? F("Senzori Consum") : F("Power Sensors")); h += F("</h2>");
-    h += F("<div style='display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px'>");
-    h += F("<div style='text-align:center;padding:8px;background:#f8f9fa;border-radius:6px'><small style='color:#666'>"); h += (appCfg.ui_lang == 0 ? F("Tensiune") : F("Voltage")); h += F("</small><br><b id='val_v'>"); h += String(s.voltage,1); h += F(" V</b></div>");
-    h += F("<div style='text-align:center;padding:8px;background:#f8f9fa;border-radius:6px'><small style='color:#666'>"); h += (appCfg.ui_lang == 0 ? F("Curent") : F("Current")); h += F("</small><br><b id='val_i'>"); h += String(s.current,3); h += F(" A</b></div>");
-    h += F("<div style='text-align:center;padding:8px;background:#f8f9fa;border-radius:6px'><small style='color:#666'>"); h += (appCfg.ui_lang == 0 ? F("Putere") : F("Power")); h += F("</small><br><b id='val_p'>"); h += String(s.power,1); h += F(" W</b></div>");
-    h += F("<div style='text-align:center;padding:8px;background:#f8f9fa;border-radius:6px'><small style='color:#666'>"); h += (appCfg.ui_lang == 0 ? F("Factor putere") : F("Power Factor")); h += F("</small><br><b id='val_pf'>"); h += String(s.pf,3); h += F("</b></div>");
-    h += F("<div style='text-align:center;padding:8px;background:#e8f5e9;border-radius:6px'><small style='color:#666'>"); h += (appCfg.ui_lang == 0 ? F("Energie") : F("Energy")); h += F("</small><br><b id='val_e' style='font-size:0.9em'>"); h += String(s.energy,4); h += F(" kWh</b></div>");
-    h += F("<button type='button' onclick='if(confirm(\"Reset?\"))hCmd(\"/reset_energy\",\"\")' style='width:100%;height:100%;padding:4px 0;border:0;border-radius:6px;background:#dc3545;color:#fff;font-weight:600;font-size:11px;cursor:pointer'>"); h += (appCfg.ui_lang == 0 ? F("RESET<br>ENERG.") : F("RESET<br>ENERGY")); h += F("</button>");
-    h += F("</div>"); // Inchide grid-ul de senzori
-    h += F("</div>"); // Inchide containerul margin-top:10px
+    h += renderSensorStats(appCfg);
 
+    h += F("</div>");
+    return h;
+  }
+
+  String renderSensorStats(const AppConfig& appCfg) const {
+    SensorSnapshot s = readSensors();
+    String h;
+    h.reserve(1000);
+    h += F("<div style='margin-top:10px'><h2 style='margin-top:0'>"); h += (appCfg.ui_lang == 0 ? F("Senzori Consum") : F("Power Sensors")); h += F("</h2>");
+    h += F("<div style='display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px'>");
+
+    appendSensorBox(h, (appCfg.ui_lang == 0 ? F("Tensiune") : F("Voltage")), F("val_v"), String(s.voltage, 1) + F(" V"));
+    appendSensorBox(h, (appCfg.ui_lang == 0 ? F("Curent") : F("Current")), F("val_i"), String(s.current, 3) + F(" A"));
+    appendSensorBox(h, (appCfg.ui_lang == 0 ? F("Putere") : F("Power")), F("val_p"), String(s.power, 1) + F(" W"));
+    appendSensorBox(h, (appCfg.ui_lang == 0 ? F("Factor putere") : F("Power Factor")), F("val_pf"), String(s.pf, 3));
+    appendSensorBox(h, (appCfg.ui_lang == 0 ? F("Energie") : F("Energy")), F("val_e"), String(s.energy, 4) + F(" kWh"), true);
+
+    h += F("<button type='button' onclick='if(confirm(\"Reset?\"))hCmd(\"/reset_energy\",\"\")' style='width:100%;height:100%;padding:4px 0;border:0;border-radius:6px;background:#dc3545;color:#fff;font-weight:600;font-size:11px;cursor:pointer'>"); h += (appCfg.ui_lang == 0 ? F("RESET<br>ENERG.") : F("RESET<br>ENERGY")); h += F("</button>");
+    h += F("</div></div>");
+    return h;
+  }
+
+  String renderRelayGrid(const AppConfig& appCfg) const {
+    String h;
+    h.reserve(1200);
+    h += F("<div style='display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:10px 0 14px 0;'>");
+    for (int i = 0; i < DEVICE_RELAY_COUNT; i++) {
+      bool on = cfgRelayState[i];
+      h += F("<button id='btn_r"); h += i;
+      h += F("' type='button' onclick='hCmd(\"/toggle\",\"id="); h += i;
+      h += F("\")' style='width:100%;padding:12px;border:0;border-radius:6px;font-weight:600;color:#fff;background:");
+      h += (on ? F("#198754") : F("#6c757d"));
+      h += F("'>");
+      h += (i < 3) ? (appCfg.ui_lang == 0 ? F("Priză ") : F("Socket ")) + String(i + 1) : F("USB");
+      h += F("<br><small id='stat_r"); h += i; h += F("' style='color:#fff'>"); h += (on ? F("ON") : F("OFF")); h += F("</small></button>");
+    }
+    h += F("<button type='button' onclick='hCmd(\"/toggle_all\",\"\")' style='width:100%;padding:12px;border:0;border-radius:6px;background:#0d6efd;color:#fff;font-weight:600'>ALL</button>");
     h += F("</div>");
     return h;
   }
@@ -1287,51 +1278,26 @@ public:
     String h;
     h.reserve(2800);
 
-    h += F("<div class='card'>");
-    h += F("<h2 style='margin-top:0'>"); h += (appCfg.ui_lang == 0 ? F("Control MQTT") : F("MQTT Control")); h += F("</h2>");
+    h += F("<div class='card'><h2 style='margin-top:0'>"); h += (appCfg.ui_lang == 0 ? F("Control MQTT") : F("MQTT Control")); h += F("</h2>");
     h += F("<p style='margin:6px 0'><b>"); h += (appCfg.ui_lang == 0 ? F("Status:") : F("Status:")); h += F("</b> ");
     h += (mqttCfg.enabled ? (appCfg.ui_lang == 0 ? F("Activat") : F("Enabled")) : (appCfg.ui_lang == 0 ? F("Dezactivat") : F("Disabled")));
-    h += F("</p>");
-    h += F("<p style='margin:6px 0'><b>"); h += (appCfg.ui_lang == 0 ? F("Broker:") : F("Broker:")); h += F("</b> ");
-    h += htmlEscape(String(mqttCfg.host));
-    h += F(":");
-    h += mqttCfg.port;
-    h += F("</p>");
-    h += F("<p style='margin:6px 0'><b>"); h += (appCfg.ui_lang == 0 ? F("Topic Principal:") : F("Base Topic:")); h += F("</b> ");
+    h += F("</p><p style='margin:6px 0'><b>"); h += (appCfg.ui_lang == 0 ? F("Broker:") : F("Broker:")); h += F("</b> ");
+    h += htmlEscape(String(mqttCfg.host)); h += F(":"); h += mqttCfg.port;
+    h += F("</p><p style='margin:6px 0'><b>Client ID:</b> ");
+    h += htmlEscape(String(mqttCfg.client_id));
+    h += F("</p><p style='margin:6px 0'><b>"); h += (appCfg.ui_lang == 0 ? F("Topic Principal:") : F("Base Topic:")); h += F("</b> ");
     h += htmlEscape(String(mqttCfg.topic));
-    h += F("</p>");
-    h += F("</div>");
+    h += F("</p></div>");
 
-    h += F("<div class='card'>");
-    h += F("<h2 style='margin-top:0'>"); h += (appCfg.ui_lang == 0 ? F("Integrări") : F("Integrations")); h += F("</h2>");
+    h += F("<div class='card'><h2 style='margin-top:0'>"); h += (appCfg.ui_lang == 0 ? F("Integrări") : F("Integrations")); h += F("</h2>");
     h += F("<a href='/ha' target='_top' style='display:block;text-align:center;padding:9px;border:1px solid #ccc;border-radius:6px;background:#f6f6f6;color:#222;text-decoration:none;margin:6px 0'>"); h += (appCfg.ui_lang == 0 ? F("Config Home Assistant") : F("Home Assistant Config")); h += F("</a>");
     h += F("<a href='/openhab' target='_top' style='display:block;text-align:center;padding:9px;border:1px solid #ccc;border-radius:6px;background:#f6f6f6;color:#222;text-decoration:none;margin:6px 0'>"); h += (appCfg.ui_lang == 0 ? F("Config openHAB") : F("openHAB Config")); h += F("</a>");
     h += F("<a href='/esphome' target='_top' style='display:block;text-align:center;padding:9px;border:1px solid #ccc;border-radius:6px;background:#f6f6f6;color:#222;text-decoration:none;margin:6px 0'>"); h += (appCfg.ui_lang == 0 ? F("Config ESPHome") : F("ESPHome Config")); h += F("</a>");
     h += F("</div>");
 
+    h += renderDerivedTopicsInfo(appCfg, mqttCfg);
 
-
-    h += F("<div class='card'>");
-    h += F("<h2 style='margin-top:0'>"); h += (appCfg.ui_lang == 0 ? F("Topicuri Derivate") : F("Derived Topics")); h += F("</h2>");
-    String base = String(mqttCfg.topic);
-    h += F("<code style='padding:6px;background:#f3f3f3;border-radius:6px;margin:4px 0'>"); h += base; h += F("/relay/[0-3]</code>");
-    h += F("<code style='padding:6px;background:#f3f3f3;border-radius:6px;margin:4px 0'>"); h += base; h += F("/relay/[0-3]/set</code>");
-    h += F("<code style='padding:6px;background:#f3f3f3;border-radius:6px;margin:4px 0'>"); h += base; h += F("/relay/all/set</code>");
-    h += F("<code style='padding:6px;background:#f3f3f3;border-radius:6px;margin:4px 0'>"); h += base; h += F("/sensors <small style='color:#888'>{json}</small></code>");
-    h += F("<code style='padding:6px;background:#f3f3f3;border-radius:6px;margin:4px 0'>"); h += base; h += F("/voltage</code>");
-    h += F("<code style='padding:6px;background:#f3f3f3;border-radius:6px;margin:4px 0'>"); h += base; h += F("/current</code>");
-    h += F("<code style='padding:6px;background:#f3f3f3;border-radius:6px;margin:4px 0'>"); h += base; h += F("/power</code>");
-    h += F("<code style='padding:6px;background:#f3f3f3;border-radius:6px;margin:4px 0'>"); h += base; h += F("/pf</code>");
-    h += F("<code style='padding:6px;background:#f3f3f3;border-radius:6px;margin:4px 0'>"); h += base; h += F("/energy</code>");
-    h += F("<code style='padding:6px;background:#f3f3f3;border-radius:6px;margin:4px 0'>"); h += base; h += F("/child_lock</code>");
-    h += F("<code style='padding:6px;background:#f3f3f3;border-radius:6px;margin:4px 0'>"); h += base; h += F("/child_lock/set</code>");
-    h += F("<code style='padding:6px;background:#f3f3f3;border-radius:6px;margin:4px 0'>"); h += base; h += F("/power_on_behavior</code>");
-    h += F("<code style='padding:6px;background:#f3f3f3;border-radius:6px;margin:4px 0'>"); h += base; h += F("/power_on_behavior/set</code>");
-    h += F("<code style='padding:6px;background:#f3f3f3;border-radius:6px;margin:4px 0'>"); h += base; h += F("/status</code>");
-    h += F("</div>");
-
-    h += F("<div class='card'>");
-    h += F("<h2 style='margin-top:0'>"); h += (appCfg.ui_lang == 0 ? F("Calibrare Senzori") : F("Sensor Calibration")); h += F("</h2>");
+    h += F("<div class='card'><h2 style='margin-top:0'>"); h += (appCfg.ui_lang == 0 ? F("Calibrare Senzori") : F("Sensor Calibration")); h += F("</h2>");
     h += F("<a href='/calibration' target='_top' style='display:block;text-align:center;padding:9px;border:1px solid #ccc;border-radius:6px;background:#f6f6f6;color:#222;text-decoration:none;margin:6px 0'>"); h += (appCfg.ui_lang == 0 ? F("Gestiune Calibrare") : F("Calibration Management")); h += F("</a>");
     h += F("<p style='margin:8px 0 0 0;color:#666;font-size:12px'>"); h += (appCfg.ui_lang == 0 ? F("Configurare factori (Auto/Manual)") : F("Configure factors (Auto/Manual)")); h += F("</p>");
     h += F("</div>");
@@ -1339,14 +1305,96 @@ public:
     return h;
   }
 
+  String renderDerivedTopicsInfo(const AppConfig& appCfg, const MqttConfig& mqttCfg) const {
+    String h;
+    h.reserve(1000);
+    h += F("<div class='card'>");
+    h += F("<h2 style='margin-top:0'>"); h += (appCfg.ui_lang == 0 ? F("Topicuri Derivate") : F("Derived Topics")); h += F("</h2>");
+    String base = String(mqttCfg.topic);
+
+    static const char* const topics[] = {
+      "/relay/[0-3]", "/relay/[0-3]/set", "/relay/all/set",
+      "/sensors <small style='color:#888'>{json}</small>", "/voltage", "/current",
+      "/power", "/pf", "/energy", "/child_lock", "/child_lock/set",
+      "/power_on_behavior", "/power_on_behavior/set", "/status"
+    };
+
+    for (const char* t : topics) {
+      h += F("<code style='padding:6px;background:#f3f3f3;border-radius:6px;margin:4px 0'>");
+      h += base; h += t;
+      h += F("</code>");
+    }
+
+    h += F("</div>");
+    return h;
+  }
+
+private:
+  void prepareDiscoveryBase(StaticJsonDocument<640>& doc, const String& avtyTopic, const String& mac, const String& id, const String& name, const char* sw) const {
+    doc.clear();
+    doc["name"] = name;
+    doc["uniq_id"] = mac + "_" + id;
+    doc["avty_t"] = avtyTopic;
+    JsonObject dev = doc.createNestedObject("device");
+    dev["ids"][0] = mac; dev["name"] = "NOUS A5T"; dev["sw"] = sw;
+  }
+
+public:
   // Called from .ino mqttConnect() after successful MQTT connection
   void onMqttConnected(PubSubClient& mqttClient, const MqttConfig& mqttCfg, const AppConfig& appCfg, const char* fwVersion) {
-    String mac = WiFi.macAddress();
-    mac.replace(":", "");
-    mac.toLowerCase();
-    publishCoreDiscovery(mqttClient, mqttCfg, mac, fwVersion);
-    publishExtraDiscovery(mqttClient, mac, mqttCfg);
-    publishAllState(mqttClient, mqttCfg, appCfg);
+    String mac = WiFi.macAddress(); mac.replace(":", ""); mac.toLowerCase();
+    String baseTopic = String(mqttCfg.topic);
+    String avtyTopic = baseTopic + "/status";
+    String haSwitchRoot = "homeassistant/switch/" + mac + "/";
+    String haSensorRoot = "homeassistant/sensor/" + mac + "/";
+    String haSelectRoot = "homeassistant/select/" + mac + "/";
+
+    StaticJsonDocument<640> doc;
+
+    // 1. Discovery Relee (Socket 1-3 + USB)
+    for (int i = 0; i < DEVICE_RELAY_COUNT; i++) {
+      String id = "relay_" + String(i);
+      prepareDiscoveryBase(doc, avtyTopic, mac, id, (i < 3 ? "Socket " + String(i + 1) : "USB Port"), fwVersion);
+      doc["stat_t"] = baseTopic + "/relay/" + String(i);
+      doc["cmd_t"] = baseTopic + "/relay/" + String(i) + "/set";
+      doc["pl_on"] = "ON"; doc["pl_off"] = "OFF";
+      String t = haSwitchRoot + id + "/config";
+      String p; serializeJson(doc, p); mqttClient.publish(t.c_str(), p.c_str(), true);
+    }
+
+    // 2. Discovery Senzori (Tehnici și Diagnostic)
+    const char* sN[] = {"voltage", "current", "power", "pf", "energy", "rssi", "uptime"};
+    const char* sU[] = {"V", "A", "W", "", "kWh", "dBm", "s"};
+    const char* sC[] = {"voltage", "current", "power", "power_factor", "energy", "signal_strength", "duration"};
+    for (int i = 0; i < 7; i++) {
+      prepareDiscoveryBase(doc, avtyTopic, mac, sN[i], sN[i], fwVersion);
+      doc["stat_t"] = baseTopic + "/sensors";
+      doc["val_tpl"] = "{{ value_json." + String(sN[i]) + " }}";
+      if (strlen(sU[i]) > 0) doc["unit_of_meas"] = sU[i];
+      if (strlen(sC[i]) > 0) doc["dev_cla"] = sC[i];
+      if (i >= 5) doc["ent_cat"] = "diagnostic";
+      String t = haSensorRoot + String(sN[i]) + "/config";
+      String p; serializeJson(doc, p); mqttClient.publish(t.c_str(), p.c_str(), true);
+    }
+
+    // 3. Child Lock
+    prepareDiscoveryBase(doc, avtyTopic, mac, "child_lock", "Child Lock", fwVersion);
+    doc["stat_t"] = baseTopic + "/child_lock";
+    doc["cmd_t"] = baseTopic + "/child_lock/set";
+    doc["pl_on"] = "ON"; doc["pl_off"] = "OFF";
+    String tcl = haSwitchRoot + "child_lock/config";
+    String pcl; serializeJson(doc, pcl); mqttClient.publish(tcl.c_str(), pcl.c_str(), true);
+
+    // 4. Power On Behavior (Select)
+    prepareDiscoveryBase(doc, avtyTopic, mac, "power_on", "Power On Behavior", fwVersion);
+    doc["stat_t"] = baseTopic + "/power_on_behavior";
+    doc["cmd_t"] = baseTopic + "/power_on_behavior/set";
+    JsonArray opt = doc.createNestedArray("options");
+    opt.add("OFF"); opt.add("ON"); opt.add("PREVIOUS");
+    String tpob = haSelectRoot + "power_on_behavior/config";
+    String ppob; serializeJson(doc, ppob); mqttClient.publish(tpob.c_str(), ppob.c_str(), true);
+
+    publishAllState(mqttClient, mqttCfg, appCfg, -2);
   }
 
   // Called from .ino mqttCallback() to route incoming MQTT commands to hardware
@@ -1354,7 +1402,7 @@ public:
     bool publishAll = false;
     int publishIdx = -1;
     if (handleCoreMqttCommand(sub, msg, appCfg, publishAll, publishIdx)) {
-      if (publishAll || publishIdx >= 0) publishAllState(mqttClient, mqttCfg, appCfg);
+      publishAllState(mqttClient, mqttCfg, appCfg, publishAll ? -2 : publishIdx);
       return;
     }
     bool configChanged = false;
@@ -1366,18 +1414,39 @@ public:
   // Register all hardware-specific HTTP routes.
   // Called once from setupRoutesNormal() in the .ino - all hardware logic stays here.
   void registerHardwareRoutes(ESP8266WebServer& server, AppConfig& appCfg, PubSubClient& mqttClient, const MqttConfig& mqttCfg, void (*markDirty)()) {
+    // --- Rute de vizualizare / Info (Securitate: Network Gate) ---
+    
+    server.on("/ha", HTTP_GET, [this, &server, &appCfg, &mqttCfg]() {
+      if (!checkNetworkGateForCurrentRequest(appCfg)) return;
+      sendConfigPage(server, appCfg, "Home Assistant YAML", F("<div class='card'><pre>") + generateHomeAssistant(mqttCfg) + F("</pre></div>"));
+    });
+
+    server.on("/openhab", HTTP_GET, [this, &server, &appCfg, &mqttCfg]() {
+      if (!checkNetworkGateForCurrentRequest(appCfg)) return;
+      sendConfigPage(server, appCfg, "OpenHAB Config", generateOpenHAB(mqttCfg));
+    });
+
+    server.on("/esphome", HTTP_GET, [this, &server, &appCfg]() {
+      if (!checkNetworkGateForCurrentRequest(appCfg)) return;
+      sendConfigPage(server, appCfg, "ESPHome YAML", F("<div class='card'><pre>") + generateESPHome(appCfg) + F("</pre></div>"));
+    });
+
+    server.on("/calibration", HTTP_GET, [this, &server, &appCfg]() {
+      if (!checkNetworkGateForCurrentRequest(appCfg)) return;
+      const char* title = (appCfg.ui_lang == 0) ? "Gestiune Calibrare" : "Calibration Management";
+      sendConfigPage(server, appCfg, title, renderCalibrationPage(appCfg));
+    });
+
+    // --- Rute de execuție / Comenzi (Securitate: Config Gate) ---
+
     server.on("/toggle", HTTP_POST, [this, &server, &appCfg, &mqttClient, &mqttCfg, markDirty]() {
       if (!checkHardwareAuth(server, appCfg)) return;
       if (!server.hasArg("id")) { server.send(400, "text/plain", "Missing id"); return; }
       String idArg = server.arg("id");
-      for (size_t i = 0; i < idArg.length(); i++) {
-        char c = idArg[i];
-        if (c < '0' || c > '9') { server.send(400, "text/plain", "Invalid id"); return; }
-      }
       int id = idArg.toInt();
       if (id < 0 || id >= DEVICE_RELAY_COUNT) { server.send(400, "text/plain", "Invalid id"); return; }
       if (handleHttpToggle(appCfg, id)) {
-        if (mqttClient.connected()) publishAllState(mqttClient, mqttCfg, appCfg);
+        if (mqttClient.connected()) publishAllState(mqttClient, mqttCfg, appCfg, id);
         markDirty();
       }
       server.send(200, "text/plain", "OK");
@@ -1385,15 +1454,8 @@ public:
 
     server.on("/toggle_all", HTTP_POST, [this, &server, &appCfg, &mqttClient, &mqttCfg, markDirty]() {
       if (!checkHardwareAuth(server, appCfg)) return;
-      bool anyOff = false;
-      for (int i = 0; i < DEVICE_RELAY_COUNT; i++) if (!cfgRelayState[i]) { anyOff = true; break; }
-      bool newState = anyOff;
-      for (int i = 0; i < DEVICE_RELAY_COUNT; i++) {
-        cfgRelayState[i] = newState;
-        setRelay(i, newState);
-      }
-      markHwCfgDirty();
-      if (mqttClient.connected()) publishAllState(mqttClient, mqttCfg, appCfg);
+      pendingToggleAll = true; 
+      if (mqttClient.connected()) publishAllState(mqttClient, mqttCfg, appCfg, -2);
       markDirty();
       server.send(200, "text/plain", "OK");
     });
@@ -1409,12 +1471,7 @@ public:
     server.on("/set_pob", HTTP_POST, [this, &server, &appCfg, &mqttClient, &mqttCfg, markDirty]() {
       if (!checkHardwareAuth(server, appCfg)) return;
       if (server.hasArg("pob")) {
-        String pobArg = server.arg("pob");
-        if (pobArg != "0" && pobArg != "1" && pobArg != "2") {
-          server.send(400, "text/plain", "Invalid pob");
-          return;
-        }
-        if (setPowerOnBehavior(appCfg, pobArg.toInt())) {
+        if (setPowerOnBehavior(appCfg, server.arg("pob").toInt())) {
           if (mqttClient.connected()) publishExtraState(mqttClient, mqttCfg, appCfg);
           markDirty();
         }
@@ -1422,31 +1479,19 @@ public:
       server.send(200, "text/plain", "OK");
     });
 
-    server.on("/calibration", HTTP_GET, [this, &server, &appCfg]() {
-      if (!checkHardwareAuth(server, appCfg)) return;
-      server.send(200, "text/html", renderCalibrationPage(appCfg));
-    });
-
-    server.on("/manual_calibration", HTTP_GET, [this, &server, &appCfg]() {
-      if (!checkHardwareAuth(server, appCfg)) return;
-      server.send(200, "text/html", renderManualCalibrationPage(appCfg));
-    });
-
     server.on("/do_calibrate", HTTP_POST, [this, &server, &appCfg, markDirty]() {
       if (!checkHardwareAuth(server, appCfg)) return;
       float target = server.hasArg("target") ? server.arg("target").toFloat() : 60.0f;
       handleStartCalibration(appCfg, target);
       markDirty();
-      server.sendHeader("Location", "/calibration", true);
-      server.send(303, "text/plain", "Redirect");
+      server.sendHeader("Location", "/calibration", true); server.send(303);
     });
 
     server.on("/reset_calibration", HTTP_POST, [this, &server, &appCfg, markDirty]() {
       if (!checkHardwareAuth(server, appCfg)) return;
       handleResetCalibration(appCfg);
       markDirty();
-      server.sendHeader("Location", "/calibration", true);
-      server.send(303, "text/plain", "Redirect");
+      server.sendHeader("Location", "/calibration", true); server.send(303);
     });
 
     server.on("/save_calibration", HTTP_POST, [this, &server, &appCfg, markDirty]() {
@@ -1456,8 +1501,7 @@ public:
       float p = server.hasArg("cal_p") ? server.arg("cal_p").toFloat() : calP;
       handleSaveCalibration(appCfg, v, ci, p);
       markDirty();
-      server.sendHeader("Location", "/calibration", true);
-      server.send(303, "text/plain", "Redirect");
+      server.sendHeader("Location", "/calibration", true); server.send(303);
     });
 
     server.on("/reset_energy", HTTP_POST, [this, &server, &appCfg, &mqttCfg, &mqttClient, markDirty]() {
@@ -1465,36 +1509,6 @@ public:
       resetEnergy();
       if (mqttClient.connected()) publishSensorsState(mqttClient, mqttCfg, appCfg);
       server.send(200, "text/plain", "OK");
-    });
-
-    server.on("/ha", HTTP_GET, [this, &server, &appCfg, &mqttCfg]() {
-      if (!checkHardwareAuth(server, appCfg)) return;
-      String body = generateHomeAssistant(mqttCfg);
-      server.send(200, "text/plain", body);
-    });
-
-    server.on("/openhab", HTTP_GET, [this, &server, &appCfg, &mqttCfg]() {
-      if (!checkHardwareAuth(server, appCfg)) return;
-      String h;
-      h.reserve(9500);
-      h += F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
-      h += F("<title>OpenHAB Config</title><style>");
-      h += F("body{font-family:sans-serif;background:#f4f4f4;margin:20px;color:#333}");
-      h += F(".card{background:#fff;border-radius:8px;padding:20px;margin-bottom:20px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}");
-      h += F("h2{margin-top:0;color:#0d6efd;font-size:1.1rem;border-bottom:1px solid #eee;padding-bottom:8px}");
-      h += F("pre{background:#f8f9fa;padding:12px;border:1px solid #ddd;border-radius:4px;overflow-x:auto;font-size:13px;white-space:pre-wrap;word-break:break-all}");
-      h += F("</style></head><body>");
-      h += F("<a href='/config' style='text-decoration:none;color:#666;font-size:14px'>&larr; Inapoi la configurari</a>");
-      h += F("<h1 style='font-size:1.5rem;margin:15px 0'>Configurare OpenHAB</h1>");
-      h += generateOpenHAB(mqttCfg);
-      h += F("</body></html>");
-      server.send(200, "text/html", h);
-    });
-
-    server.on("/esphome", HTTP_GET, [this, &server, &appCfg]() {
-      if (!checkHardwareAuth(server, appCfg)) return;
-      String body = generateESPHome(appCfg);
-      server.send(200, "text/plain", body);
     });
   }
 };

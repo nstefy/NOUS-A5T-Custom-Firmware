@@ -9,6 +9,9 @@
 #include <PubSubClient.h>
 #include <LittleFS.h>
 #include <ctype.h>
+// ================= HARDWARE ABSTRACTION =================
+#define DEVICE_HARDWARE_IMPL_HEADER "DeviceHardware_NousA5T.h"
+#define CORE_VERSION         "v.1.0.1"
 
 // ================= SETTINGS =================
 #define CONFIG_MAGIC         0xA5A50006
@@ -24,17 +27,17 @@
 
 // ================= DATA MODELS =================
 struct WifiConfig {
-  char ssid[32];
-  char pass[32];
+  char ssid[64];
+  char pass[64];
 };
 
 struct MqttConfig {
-  char host[32];
+  char host[64];
   uint16_t port;
-  char user[32];
-  char pass[32];
-  char client_id[32];
-  char topic[32];
+  char user[64];
+  char pass[64];
+  char client_id[64];
+  char topic[64];
   bool enabled;
   char mdns_hostname[32];
   uint16_t pub_interval;
@@ -84,7 +87,6 @@ bool checkNetworkGateForCurrentRequest(const AppConfig& appCfg);
 
 // ================= HARDWARE ABSTRACTION =================
 // Include identitatea dispozitivului inainte de orice definitie
-#define DEVICE_HARDWARE_IMPL_HEADER "DeviceHardware_NousA5T.h"
 #include DEVICE_HARDWARE_IMPL_HEADER
 
 // FW_VERSION este acum compus din modelul definit in header
@@ -107,6 +109,8 @@ unsigned long lastChangeTime = 0;
 unsigned long lastMqttReconnectAttempt = 0;
 unsigned long lastMqttPublish = 0;
 bool lastMqttConnectedState = false;
+bool requestFactoryReset = false;
+bool pwrCycCleared = false;
 unsigned long lastUiRealtimePush = 0;
 
 unsigned long wifiConnectCount = 0;
@@ -155,7 +159,6 @@ bool checkNetworkAccess();
 bool checkConfigAccess();
 bool isNetAuthSessionValid();
 void rememberNetAuthSession();
-String htmlEscape(const String& input);
 String sanitizeLocalRedirect(const String& url);
 bool isValidMdnsHostname(const String& host);
 
@@ -169,23 +172,6 @@ uint32_t calcCrc32(const uint8_t* data, size_t len) {
     }
   }
   return ~crc;
-}
-
-String htmlEscape(const String& input) {
-  String out;
-  out.reserve(input.length() + 8);
-  for (size_t i = 0; i < input.length(); i++) {
-    char c = input[i];
-    switch (c) {
-      case '&': out += F("&amp;"); break;
-      case '<': out += F("&lt;"); break;
-      case '>': out += F("&gt;"); break;
-      case '"': out += F("&quot;"); break;
-      case '\'': out += F("&#39;"); break;
-      default: out += c; break;
-    }
-  }
-  return out;
 }
 
 bool isValidMdnsHostname(const String& host) {
@@ -273,12 +259,14 @@ void defaultConfigs() {
   memset(&mqttCfg, 0, sizeof(mqttCfg));
   memset(&appCfg, 0, sizeof(appCfg));
 
+  String defaultHost = hw.getDefaultHostname();
+
   mqttCfg.port = 1883;
   mqttCfg.enabled = false;
   mqttCfg.pub_interval = 1;
-  strlcpy(mqttCfg.client_id, "esp8266_adv_template", sizeof(mqttCfg.client_id));
-  strlcpy(mqttCfg.topic, "esp/device", sizeof(mqttCfg.topic));
-  strlcpy(mqttCfg.mdns_hostname, hw.getDefaultHostname().c_str(), sizeof(mqttCfg.mdns_hostname));
+  strlcpy(mqttCfg.client_id, defaultHost.c_str(), sizeof(mqttCfg.client_id));
+  strlcpy(mqttCfg.topic, defaultHost.c_str(), sizeof(mqttCfg.topic));
+  strlcpy(mqttCfg.mdns_hostname, defaultHost.c_str(), sizeof(mqttCfg.mdns_hostname));
 
   appCfg.magic = CONFIG_MAGIC;
   appCfg.ui_lang = 1;
@@ -384,9 +372,18 @@ void loadConfigs() {
     f.close();
   }
 
+  // Sanitizare: Dacă valorile sunt goale sau invalide, forțăm formatul dinamic bazat pe Chip ID
+  String defHost = hw.getDefaultHostname();
   if (strlen(mqttCfg.mdns_hostname) == 0 || !isValidMdnsHostname(String(mqttCfg.mdns_hostname))) {
-    strlcpy(mqttCfg.mdns_hostname, hw.getDefaultHostname().c_str(), sizeof(mqttCfg.mdns_hostname));
+    strlcpy(mqttCfg.mdns_hostname, defHost.c_str(), sizeof(mqttCfg.mdns_hostname));
   }
+  if (strlen(mqttCfg.topic) == 0) {
+    strlcpy(mqttCfg.topic, defHost.c_str(), sizeof(mqttCfg.topic));
+  }
+  if (strlen(mqttCfg.client_id) == 0) {
+    strlcpy(mqttCfg.client_id, defHost.c_str(), sizeof(mqttCfg.client_id));
+  }
+
   if (strlen(appCfg.setup_ap_pass) < 8 || strlen(appCfg.setup_ap_pass) > 31) {
     strlcpy(appCfg.setup_ap_pass, DEFAULT_AP_PASS, sizeof(appCfg.setup_ap_pass));
   }
@@ -461,6 +458,9 @@ void mqttSubscribeTopics() {
 bool mqttConnect() {
   if (!mqttCfg.enabled || strlen(mqttCfg.host) == 0) return false;
 
+  // Asigurăm că PubSubClient folosește cele mai recente setări din config
+  mqtt.setServer(mqttCfg.host, mqttCfg.port);
+
   String lwtTopic = String(mqttCfg.topic) + "/status";
   bool ok;
   if (strlen(mqttCfg.user) > 0) {
@@ -476,8 +476,6 @@ bool mqttConnect() {
     mqttSubscribeTopics();
     // Hardware publichiază discovery și status
       hw.onMqttConnected(mqtt, mqttCfg, appCfg, FW_VERSION);
-  } else {
-    mqttDisconnectCount++;
   }
 
   return ok;
@@ -498,49 +496,65 @@ void sendRedirect(const String& url) {
   server.send(303, "text/plain", "Redirect");
 }
 
+// ================= UI HELPERS =================
+String getCommonCss() {
+  String css;
+  css.reserve(1200);
+  css += F("<style>*{box-sizing:border-box}body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}"
+           ".card{background:white;padding:16px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);margin-bottom:12px;overflow:hidden;word-break:break-all}"
+           ".mini-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;align-items:start}"
+           ".mini-card h2{font-size:16px;margin-bottom:8px}.mini-card p{font-size:13px;margin:6px 0}h2{color:#333;margin-top:0}p{margin:8px 0;color:#666}"
+           ".status-ok{color:#28a745;font-weight:bold}.status-err{color:#dc3545;font-weight:bold}nav{margin-bottom:20px}"
+           "nav a{display:inline-block;padding:10px 15px;background:#007bff;color:white;text-decoration:none;border-radius:4px;margin-right:5px}nav a:hover{background:#0056b3}"
+           "form{display:flex;flex-direction:column}label{margin-top:10px;font-weight:bold;color:#333;display:block}"
+           "input,select{width:100%;padding:8px;margin-top:5px;border:1px solid #ddd;border-radius:4px}"
+           "button{width:100%;margin-top:15px;padding:10px;background:#007bff;color:white;border:none;border-radius:4px;cursor:pointer}button:hover{background:#0056b3}"
+           "code,pre{word-break:break-all;white-space:pre-wrap;display:block;font-size:12px}.config-grid, .grid2{display:grid;grid-template-columns:1fr;gap:20px;align-items:start}"
+           "@media(min-width:700px){.config-grid, .grid2{grid-template-columns:1fr 1fr}}");
+  css += F("</style>");
+  return css;
+}
+
+String getCommonHeader(const String& title, const String& fromUrl) {
+  String h;
+  h.reserve(600);
+  h += F("<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:15px'><h1 style='margin:0'>");
+  h += title;
+  h += F("</h1><div style='display:flex;gap:5px'><a href='/save_lang?lang=0&from=");
+  h += fromUrl; h += F("' style='text-decoration:none;padding:5px 12px;border:1px solid #007bff;border-radius:4px;font-size:12px;font-weight:bold;");
+  h += (appCfg.ui_lang == 0 ? F("background:#007bff;color:#fff") : F("background:#fff;color:#007bff"));
+  h += F("'>RO</a><a href='/save_lang?lang=1&from="); h += fromUrl; h += F("' style='text-decoration:none;padding:5px 12px;border:1px solid #007bff;border-radius:4px;font-size:12px;font-weight:bold;");
+  h += (appCfg.ui_lang == 1 ? F("background:#007bff;color:#fff") : F("background:#fff;color:#007bff"));
+  h += F("'>EN</a>");
+  h += F("</div></div>");
+  return h;
+}
+
+String getCommonNav() {
+  String n;
+  n.reserve(400);
+  n += F("<nav>");
+  n += F("<a href='/'>"); n += (appCfg.ui_lang == 0 ? F("Status") : F("Status"));
+  n += F("</a><a href='/config'>"); n += (appCfg.ui_lang == 0 ? F("Config") : F("Config"));
+  n += F("</a><a href='/security'>"); n += (appCfg.ui_lang == 0 ? F("Securitate") : F("Security"));
+  n += F("</a><a href='/update'>"); n += (appCfg.ui_lang == 0 ? F("Actualizare OTA") : F("OTA Update"));
+  n += F("</a></nav>");
+  return n;
+}
+
 void pageStatus() {
   if (!checkNetworkAccess()) return;
 
   String html;
-  html.reserve(4600);
+  html.reserve(3200);
 
   html += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<title>Status</title>");
-  html += F("<style>");
-  html += F("body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}");
-  html += F(".card{background:white;padding:16px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);margin-bottom:12px}");
-  html += F(".mini-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;align-items:start}");
-  html += F(".mini-card h2{font-size:16px;margin-bottom:8px}");
-  html += F(".mini-card p{font-size:13px;margin:6px 0}");
-  html += F("h2{color:#333;margin-top:0}");
-  html += F("p{margin:8px 0;color:#666}");
-  html += F(".status-ok{color:#28a745;font-weight:bold}");
-  html += F(".status-err{color:#dc3545;font-weight:bold}");
-  html += F("nav{margin-bottom:20px}");
-  html += F("nav a{display:inline-block;padding:10px 15px;background:#007bff;color:white;text-decoration:none;border-radius:4px;margin-right:5px}");
-  html += F("nav a:hover{background:#0056b3}");
-  html += F("</style>");
+  html += getCommonCss();
   html += F("</head><body>");
 
-  // Page Header with Language Selectors
-  html += F("<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:15px'>");
-  html += F("<h1 style='margin:0'>"); html += (appCfg.ui_lang == 0 ? F("Status Dispozitiv") : F("Device Status")); html += F("</h1>");
-  html += F("<div style='display:flex;gap:5px'>");
-  html += F("<a href='/save_lang?lang=0&from=/' style='text-decoration:none;padding:5px 12px;border:1px solid #007bff;border-radius:4px;font-size:12px;font-weight:bold;");
-  html += (appCfg.ui_lang == 0 ? F("background:#007bff;color:#fff") : F("background:#fff;color:#007bff"));
-  html += F("'>RO</a>");
-  html += F("<a href='/save_lang?lang=1&from=/' style='text-decoration:none;padding:5px 12px;border:1px solid #007bff;border-radius:4px;font-size:12px;font-weight:bold;");
-  html += (appCfg.ui_lang == 1 ? F("background:#007bff;color:#fff") : F("background:#fff;color:#007bff"));
-  html += F("'>EN</a>");
-  html += F("</div></div>");
-
-  // Navigation
-  html += F("<nav>");
-  html += F("<a href='/'>"); html += (appCfg.ui_lang == 0 ? F("Status") : F("Status")); html += F("</a>");
-  html += F("<a href='/config'>"); html += (appCfg.ui_lang == 0 ? F("Config") : F("Config")); html += F("</a>");
-  html += F("<a href='/security'>"); html += (appCfg.ui_lang == 0 ? F("Securitate") : F("Security")); html += F("</a>");
-  html += F("<a href='/update'>"); html += (appCfg.ui_lang == 0 ? F("Actualizare OTA") : F("OTA Update")); html += F("</a>");
-  html += F("</nav>");
+  html += getCommonHeader(appCfg.ui_lang == 0 ? F("Status Dispozitiv") : F("Device Status"), F("/"));
+  html += getCommonNav();
 
   // Hardware controls first (requested)
   html += hw.renderMainPageFrame(FW_VERSION, WiFi.localIP().toString(), WiFi.RSSI(), mqtt.connected(), appCfg);
@@ -550,6 +564,7 @@ void pageStatus() {
   html += F("<div class='card mini-card'>");
   html += F("<h2>"); html += (appCfg.ui_lang == 0 ? F("Informații Dispozitiv") : F("Device Information")); html += F("</h2>");
   html += F("<p><b>Firmware:</b> "); html += FW_VERSION; html += F("</p>");
+  html += F("<p><b>Core S:</b> "); html += CORE_VERSION; html += F("</p>");
   html += F("<p><b>MAC Address:</b> "); html += WiFi.macAddress(); html += F("</p>");
   html += F("<p><b>Chip ID:</b> "); html += String(ESP.getChipId(), HEX); html += F("</p>");
   html += F("<p><b>"); html += (appCfg.ui_lang == 0 ? F("RAM Liber:") : F("Free RAM:")); html += F("</b> <span id='val_heap'>"); html += (ESP.getFreeHeap() / 1024); html += F("</span> KB</p>");
@@ -571,7 +586,7 @@ void pageStatus() {
   html += (connected ? (appCfg.ui_lang == 0 ? F("WiFi: Conectat ✓") : F("WiFi: Connected ✓")) : (appCfg.ui_lang == 0 ? F("WiFi: Deconectat ✗") : F("WiFi: Disconnected ✗")));
   html += F("</p>");
   
-  html += F("<p><b>SSID:</b> "); html += htmlEscape(WiFi.SSID()); html += F("</p>");
+  html += F("<p><b>SSID:</b> "); html += DeviceHardware::htmlEscape(WiFi.SSID()); html += F("</p>");
   html += F("<p><b>IP Address:</b> "); html += WiFi.localIP().toString(); html += F("</p>");
   html += F("<p><b>Signal Strength (RSSI):</b> <span id='val_rssi'>"); html += WiFi.RSSI(); html += F("</span> dBm</p>");
 
@@ -587,8 +602,8 @@ void pageStatus() {
   html += F("<p id='mqtt_stat' class='"); html += (mConnected ? F("status-ok") : F("status-err")); html += F("'>");
   if (mqttCfg.enabled) {
     html += (mConnected ? (appCfg.ui_lang == 0 ? F("MQTT: Conectat ✓") : F("MQTT: Connected ✓")) : (appCfg.ui_lang == 0 ? F("MQTT: Deconectat ✗") : F("MQTT: Disconnected ✗")));
-    html += F("</p><p><b>Broker:</b> "); html += htmlEscape(mqttCfg.host); html += F(":"); html += mqttCfg.port; html += F("</p>");
-    html += F("<p><b>Topic:</b> "); html += htmlEscape(mqttCfg.topic); html += F("</p>");
+    html += F("</p><p><b>Broker:</b> "); html += DeviceHardware::htmlEscape(mqttCfg.host); html += F(":"); html += mqttCfg.port; html += F("</p>");
+    html += F("<p><b>Topic:</b> "); html += DeviceHardware::htmlEscape(mqttCfg.topic); html += F("</p>");
     html += F("<p><b>MQTT Connections:</b> "); html += mqttConnectCount; html += F("</p>");
     html += F("<p><b>MQTT Disconnections:</b> "); html += mqttDisconnectCount; html += F("</p>");
     } else {
@@ -629,47 +644,15 @@ void pageConfig() {
   if (!checkConfigAccess()) return;
 
   String html;
-  html.reserve(6000); // Increased reserve size to prevent HTML truncation and ensure correct layout
+  html.reserve(4500);
 
   html += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<title>Configuration</title>");
-  html += F("<style>");
-  html += F("*{box-sizing:border-box}body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}");
-  html += F(".card{background:white;padding:16px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);margin-bottom:12px;overflow:hidden;word-break:break-all}");
-  html += F("h2{color:#333;margin-top:0}");
-  html += F("form{display:flex;flex-direction:column}");
-  html += F("label{margin-top:10px;font-weight:bold;color:#333}");
-  html += F("input,select{width:100%;padding:8px;margin-top:5px;border:1px solid #ddd;border-radius:4px}");
-  html += F("button{width:100%;margin-top:15px;padding:10px;background:#007bff;color:white;border:none;border-radius:4px;cursor:pointer}");
-  html += F("button:hover{background:#0056b3}");
-  html += F("code,pre{word-break:break-all;white-space:pre-wrap;display:block;font-size:12px}");
-  html += F(".config-grid{display:grid;grid-template-columns:1fr;gap:20px;align-items:start}");
-  html += F("@media(min-width:700px){.config-grid{grid-template-columns:1fr 1fr}}");
-  html += F("nav{margin-bottom:20px}");
-  html += F("nav a{display:inline-block;padding:10px 15px;background:#007bff;color:white;text-decoration:none;border-radius:4px;margin-right:5px}");
-  html += F("nav a:hover{background:#0056b3}");
-  html += F("</style>");
+  html += getCommonCss();
   html += F("</head><body>");
 
-  // Page Header with Language Selectors
-  html += F("<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:15px'>");
-  html += F("<h1 style='margin:0'>"); html += (appCfg.ui_lang == 0 ? F("Configurări") : F("Configuration")); html += F("</h1>");
-  html += F("<div style='display:flex;gap:5px'>");
-  html += F("<a href='/save_lang?lang=0&from=/config' style='text-decoration:none;padding:5px 12px;border:1px solid #007bff;border-radius:4px;font-size:12px;font-weight:bold;");
-  html += (appCfg.ui_lang == 0 ? F("background:#007bff;color:#fff") : F("background:#fff;color:#007bff"));
-  html += F("'>RO</a>");
-  html += F("<a href='/save_lang?lang=1&from=/config' style='text-decoration:none;padding:5px 12px;border:1px solid #007bff;border-radius:4px;font-size:12px;font-weight:bold;");
-  html += (appCfg.ui_lang == 1 ? F("background:#007bff;color:#fff") : F("background:#fff;color:#007bff"));
-  html += F("'>EN</a>");
-  html += F("</div></div>");
-
-  // Navigation
-  html += F("<nav>");
-  html += F("<a href='/'>"); html += (appCfg.ui_lang == 0 ? F("Status") : F("Status")); html += F("</a>");
-  html += F("<a href='/config'>"); html += (appCfg.ui_lang == 0 ? F("Config") : F("Config")); html += F("</a>");
-  html += F("<a href='/security'>"); html += (appCfg.ui_lang == 0 ? F("Securitate") : F("Security")); html += F("</a>");
-  html += F("<a href='/update'>"); html += (appCfg.ui_lang == 0 ? F("Actualizare OTA") : F("OTA Update")); html += F("</a>");
-  html += F("</nav>");
+  html += getCommonHeader(appCfg.ui_lang == 0 ? F("Configurări") : F("Configuration"), F("/config"));
+  html += getCommonNav();
 
   if (server.hasArg("saved")) {
     html += F("<div id='svmsg' style='position:fixed;top:20px;left:50%;transform:translateX(-50%);background:#28a745;color:white;padding:12px 25px;border-radius:30px;z-index:10000;box-shadow:0 4px 12px rgba(0,0,0,0.2);font-weight:bold;'>");
@@ -685,13 +668,15 @@ void pageConfig() {
   html += F("<h2>"); html += (appCfg.ui_lang == 0 ? F("Setări MQTT") : F("MQTT Settings")); html += F("</h2>");
   html += F("<form method='post' action='/save_connection'>");
   html += F("<label>"); html += (appCfg.ui_lang == 0 ? F("Gazdă MQTT:") : F("MQTT Host:")); html += F("</label>");
-  html += F("<input type='text' name='host' value='"); html += htmlEscape(mqttCfg.host); html += F("'>");
+  html += F("<input type='text' name='host' value='"); html += DeviceHardware::htmlEscape(mqttCfg.host); html += F("'>");
   html += F("<label>"); html += (appCfg.ui_lang == 0 ? F("Port MQTT:") : F("MQTT Port:")); html += F("</label>");
   html += F("<input type='number' name='port' value='"); html += mqttCfg.port; html += F("'>");
+  html += F("<label>"); html += (appCfg.ui_lang == 0 ? F("Client ID MQTT:") : F("MQTT Client ID:")); html += F("</label>");
+  html += F("<input type='text' name='client_id' value='"); html += DeviceHardware::htmlEscape(mqttCfg.client_id); html += F("'>");
   html += F("<label>"); html += (appCfg.ui_lang == 0 ? F("Utilizator MQTT:") : F("MQTT User:")); html += F("</label>");
-  html += F("<input type='text' name='user' value='"); html += htmlEscape(mqttCfg.user); html += F("'>");
+  html += F("<input type='text' name='user' value='"); html += DeviceHardware::htmlEscape(mqttCfg.user); html += F("'>");
   html += F("<label>"); html += (appCfg.ui_lang == 0 ? F("Parolă MQTT:") : F("MQTT Password:")); html += F("</label>");
-  html += F("<input type='password' name='mqtpass' value='"); html += htmlEscape(mqttCfg.pass); html += F("'>");
+  html += F("<input type='password' name='mqtpass' value='"); html += DeviceHardware::htmlEscape(mqttCfg.pass); html += F("'>");
   html += F("<button type='button' onclick='testMqtt()' style='background:#6c757d'>"); html += (appCfg.ui_lang == 0 ? F("Test conexiune MQTT") : F("Test MQTT connection")); html += F("</button>");
   html += F("<button type='submit'>"); html += (appCfg.ui_lang == 0 ? F("Salvează MQTT") : F("Save MQTT")); html += F("</button>");
   html += F("</form>");
@@ -703,13 +688,13 @@ void pageConfig() {
 
   html += F("<form method='post' action='/save_topic'>");
   html += F("<label>"); html += (appCfg.ui_lang == 0 ? F("Topic principal:") : F("Base Topic:")); html += F("</label>");
-  html += F("<input type='text' name='topic' value='"); html += htmlEscape(mqttCfg.topic); html += F("'>");
+  html += F("<input type='text' name='topic' value='"); html += DeviceHardware::htmlEscape(mqttCfg.topic); html += F("'>");
   html += F("<button type='submit'>"); html += (appCfg.ui_lang == 0 ? F("Salvează Topic") : F("Save Topic")); html += F("</button>");
   html += F("</form>");
 
   html += F("<form method='post' action='/save_mdns'>");
   html += F("<label>"); html += (appCfg.ui_lang == 0 ? F("Nume gazdă mDNS:") : F("mDNS hostname:")); html += F("</label>");
-  html += F("<input type='text' name='mdns' value='"); html += htmlEscape(mqttCfg.mdns_hostname); html += F("'>");
+  html += F("<input type='text' name='mdns' value='"); html += DeviceHardware::htmlEscape(mqttCfg.mdns_hostname); html += F("'>");
   html += F("<button type='submit'>"); html += (appCfg.ui_lang == 0 ? F("Salvează mDNS") : F("Save mDNS")); html += F("</button>");
   html += F("</form>");
 
@@ -727,8 +712,16 @@ void pageConfig() {
   html += (mqttCfg.enabled ? (appCfg.ui_lang == 0 ? F("Dezactivează MQTT") : F("Disable MQTT")) : (appCfg.ui_lang == 0 ? F("Activează MQTT") : F("Enable MQTT")));
   html += F("</button>");
   html += F("</form>");
+  html += F("</div>"); // Închide 'Additional Settings'
 
-  html += F("</div></div>"); // Închide cardul 'Additional Settings' ȘI coloana din stânga
+  // Danger Zone - Mutat aici din header
+  html += F("<div class='card' style='border:1px solid #dc3545'>");
+  html += F("<h2 style='color:#dc3545'>"); html += (appCfg.ui_lang == 0 ? F("Zonă Periculoasă") : F("Danger Zone")); html += F("</h2>");
+  html += F("<button type='button' style='background:#dc3545;color:#fff' onclick='factoryReset()'>"); 
+  html += (appCfg.ui_lang == 0 ? F("Resetare din Fabrică") : F("Factory Reset")); html += F("</button>");
+  html += F("</div>");
+
+  html += F("</div>"); // Închide coloana din stânga
 
   // Right column - additional non-hardware config (kept in INO)
   html += F("<div>");
@@ -741,7 +734,16 @@ void pageConfig() {
 
   html += F("<script>");
   html += F("function testMqtt(){const l="); html += appCfg.ui_lang;
-  html += F(";fetch('/api/test_mqtt').then(r=>r.json()).then(d=>{alert((d.connected?(l==0?'Conectat la ':'Connected to '):(l==0?'Eroare conexiune la ':'Failed to connect to '))+d.host);}).catch(e=>alert('Error'));}");
+  html += F(";const b=document.querySelector('button[onclick=\"testMqtt()\"]');");
+  html += F("const ot=b.innerText;b.innerText=(l==0?'Se testează...':'Testing...');b.disabled=true;");
+  html += F("const f=document.querySelector('form[action=\"/save_connection\"]');");
+  html += F("const d=new URLSearchParams(new FormData(f));");
+  html += F("fetch('/api/test_mqtt',{method:'POST',body:d}).then(r=>r.ok?r.json():Promise.reject()).then(d=>{");
+  html += F("alert((d.connected?(l==0?'Conectat la ':'Connected to '):(l==0?'Eroare conexiune la ':'Failed to connect to '))+d.host);");
+  html += F("}).catch(e=>alert(l==0?'Eroare rețea sau timeout':'Network error or timeout'))");
+  html += F(".finally(()=>{b.innerText=ot;b.disabled=false;});}");
+  html += F("function factoryReset(){const l="); html += appCfg.ui_lang;
+  html += F(";if(confirm(l==0?'Ești sigur că vrei să ștergi toate setările?':'Are you sure you want to delete all settings?'))location.href='/factory_reset';}");
   html += F("</script>");
 
   html += F("</body></html>");
@@ -752,40 +754,15 @@ void pageSecurity() {
   if (!checkConfigAccess()) return;
 
   String html;
-  html.reserve(5200);
+  html.reserve(4000);
 
   html += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<title>Security</title>");
-  html += F("<style>");
-  html += F("body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}");
-  html += F(".card{background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);margin-bottom:15px}");
-  html += F(".grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}");
-  html += F("h2{color:#333;margin-top:0}");
-  html += F("label{margin-top:10px;font-weight:bold;color:#333;display:block}");
-  html += F("input,select{width:100%;padding:8px;margin-top:5px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}");
-  html += F("button{margin-top:15px;padding:10px;background:#007bff;color:white;border:none;border-radius:4px;cursor:pointer}");
-  html += F("button:hover{background:#0056b3}");
-  html += F("nav{margin-bottom:20px}");
-  html += F("nav a{display:inline-block;padding:10px 15px;background:#007bff;color:white;text-decoration:none;border-radius:4px;margin-right:5px}");
-  html += F("nav a:hover{background:#0056b3}");
-  html += F("small{color:#666}");
-  html += F("@media(max-width:900px){.grid2{grid-template-columns:1fr}}");
-  html += F("</style>");
+  html += getCommonCss();
   html += F("</head><body>");
 
-  // Page Header with Language Selectors
-  html += F("<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:15px'>");
-  html += F("<h1 style='margin:0'>"); html += (appCfg.ui_lang == 0 ? F("Securitate") : F("Security")); html += F("</h1>");
-  html += F("<div style='display:flex;gap:5px'>");
-  html += F("<a href='/save_lang?lang=0&from=/security' style='text-decoration:none;padding:5px 12px;border:1px solid #007bff;border-radius:4px;font-size:12px;font-weight:bold;");
-  html += (appCfg.ui_lang == 0 ? F("background:#007bff;color:#fff") : F("background:#fff;color:#007bff"));
-  html += F("'>RO</a>");
-  html += F("<a href='/save_lang?lang=1&from=/security' style='text-decoration:none;padding:5px 12px;border:1px solid #007bff;border-radius:4px;font-size:12px;font-weight:bold;");
-  html += (appCfg.ui_lang == 1 ? F("background:#007bff;color:#fff") : F("background:#fff;color:#007bff"));
-  html += F("'>EN</a>");
-  html += F("</div></div>");
-
-  html += F("<nav><a href='/'>"); html += (appCfg.ui_lang == 0 ? F("Status") : F("Status")); html += F("</a><a href='/config'>"); html += (appCfg.ui_lang == 0 ? F("Config") : F("Config")); html += F("</a><a href='/security'>"); html += (appCfg.ui_lang == 0 ? F("Securitate") : F("Security")); html += F("</a><a href='/update'>"); html += (appCfg.ui_lang == 0 ? F("Actualizare OTA") : F("OTA Update")); html += F("</a></nav>");
+  html += getCommonHeader(appCfg.ui_lang == 0 ? F("Securitate") : F("Security"), F("/security"));
+  html += getCommonNav();
 
   if (server.hasArg("saved")) {
     html += F("<div id='svmsg' style='position:fixed;top:20px;left:50%;transform:translateX(-50%);background:#28a745;color:white;padding:12px 25px;border-radius:30px;z-index:10000;box-shadow:0 4px 12px rgba(0,0,0,0.2);font-weight:bold;'>");
@@ -809,9 +786,9 @@ void pageSecurity() {
   html += F("'>ON</a></div>");
 
   html += F("<label>"); html += (appCfg.ui_lang == 0 ? F("Nume Utilizator Rețea:") : F("Network Username:")); html += F("</label>");
-  html += F("<input type='text' name='user_root' value='"); html += htmlEscape(appCfg.user_root); html += F("'>");
+  html += F("<input type='text' name='user_root' value='"); html += DeviceHardware::htmlEscape(appCfg.user_root); html += F("'>");
   html += F("<label>"); html += (appCfg.ui_lang == 0 ? F("Parolă Rețea:") : F("Network Password:")); html += F("</label>");
-  html += F("<input type='password' name='pass_root' value='"); html += htmlEscape(appCfg.pass_root); html += F("'>");
+  html += F("<input type='password' name='pass_root' value='"); html += DeviceHardware::htmlEscape(appCfg.pass_root); html += F("'>");
   html += F("<small>"); html += (appCfg.ui_lang == 0 ? F("Protejează toate paginile (status/config/securitate/actualizare).") : F("Protects all pages (status/config/security/update).")); html += F("</small>");
   html += F("<button type='submit'>"); html += (appCfg.ui_lang == 0 ? F("Salvează Acces Rețea") : F("Save Net Access")); html += F("</button>");
   html += F("</form>");
@@ -831,9 +808,9 @@ void pageSecurity() {
   html += F("'>ON</a></div>");
 
   html += F("<label>"); html += (appCfg.ui_lang == 0 ? F("Nume Utilizator Configurare:") : F("Config Username:")); html += F("</label>");
-  html += F("<input type='text' name='user_config' value='"); html += htmlEscape(appCfg.user_config); html += F("'>");
+  html += F("<input type='text' name='user_config' value='"); html += DeviceHardware::htmlEscape(appCfg.user_config); html += F("'>");
   html += F("<label>"); html += (appCfg.ui_lang == 0 ? F("Parolă Configurare:") : F("Config Password:")); html += F("</label>");
-  html += F("<input type='password' name='pass_config' value='"); html += htmlEscape(appCfg.pass_config); html += F("'>");
+  html += F("<input type='password' name='pass_config' value='"); html += DeviceHardware::htmlEscape(appCfg.pass_config); html += F("'>");
   html += F("<small>"); html += (appCfg.ui_lang == 0 ? F("Adaugă o a doua poartă pentru rutele de config/securitate/actualizare.") : F("Adds second gate for config/security/update/routes.")); html += F("</small>");
   html += F("<button type='submit'>"); html += (appCfg.ui_lang == 0 ? F("Salvează Acces Config") : F("Save Config Access")); html += F("</button>");
   html += F("</form>");
@@ -847,14 +824,14 @@ void pageSecurity() {
   // OTA Password Form (Horizontal)
   html += F("<form method='post' action='/save_security' style='flex-direction:row;align-items:flex-end;gap:10px;margin-bottom:15px'>");
   html += F("<div style='flex:1'><label>"); html += (appCfg.ui_lang == 0 ? F("Parolă OTA:") : F("OTA Password:")); html += F("</label>");
-  html += F("<input type='password' name='ota_pass' value='"); html += htmlEscape(appCfg.ota_pass); html += F("'></div>");
+  html += F("<input type='password' name='ota_pass' value='"); html += DeviceHardware::htmlEscape(appCfg.ota_pass); html += F("'></div>");
   html += F("<button type='submit' style='margin-top:0;width:auto;white-space:nowrap'>"); html += (appCfg.ui_lang == 0 ? F("Salvează") : F("Save")); html += F("</button>");
   html += F("</form>");
 
   // Setup AP Password Form (Horizontal)
   html += F("<form method='post' action='/save_security' style='flex-direction:row;align-items:flex-end;gap:10px'>");
   html += F("<div style='flex:1'><label>"); html += (appCfg.ui_lang == 0 ? F("Parolă AP Configurare:") : F("Setup AP Password:")); html += F("</label>");
-  html += F("<input type='password' name='setup_ap_pass' value='"); html += htmlEscape(appCfg.setup_ap_pass); html += F("'></div>");
+  html += F("<input type='password' name='setup_ap_pass' value='"); html += DeviceHardware::htmlEscape(appCfg.setup_ap_pass); html += F("'></div>");
   html += F("<button type='submit' style='margin-top:0;width:auto;white-space:nowrap'>"); html += (appCfg.ui_lang == 0 ? F("Salvează") : F("Save")); html += F("</button>");
   html += F("</form>");
 
@@ -870,37 +847,18 @@ void pageSecurity() {
 
 void pageSetup() {
   String html;
-  html.reserve(3800);
+  html.reserve(3000);
+  String defaultHost = hw.getDefaultHostname();
 
   int wifiCount = WiFi.scanNetworks();
 
   html += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<title>Setup</title>");
-  html += F("<style>");
-  html += F("body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}");
-  html += F(".card{background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}");
-  html += F("h2{color:#333;margin-top:0}");
-  html += F("form{display:flex;flex-direction:column}");
-  html += F("label{margin-top:10px;font-weight:bold;color:#333}");
-  html += F("input,select{padding:8px;margin-top:5px;border:1px solid #ddd;border-radius:4px}");
-  html += F("button{margin-top:15px;padding:10px;background:#007bff;color:white;border:none;border-radius:4px;cursor:pointer}");
-  html += F("button:hover{background:#0056b3}");
-  html += F("</style>");
+  html += getCommonCss();
   html += F("</head><body>");
 
   html += F("<div class='card'>");
-
-  // Page Header with Language Selectors (Setup Mode)
-  html += F("<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:15px'>");
-  html += F("<h1 style='margin:0'>"); html += (appCfg.ui_lang == 0 ? F("Configurare Inițială") : F("Initial Setup")); html += F("</h1>");
-  html += F("<div style='display:flex;gap:5px'>");
-  html += F("<a href='/save_lang?lang=0&from=/' style='text-decoration:none;padding:5px 12px;border:1px solid #007bff;border-radius:4px;font-size:12px;font-weight:bold;");
-  html += (appCfg.ui_lang == 0 ? F("background:#007bff;color:#fff") : F("background:#fff;color:#007bff"));
-  html += F("'>RO</a>");
-  html += F("<a href='/save_lang?lang=1&from=/' style='text-decoration:none;padding:5px 12px;border:1px solid #007bff;border-radius:4px;font-size:12px;font-weight:bold;");
-  html += (appCfg.ui_lang == 1 ? F("background:#007bff;color:#fff") : F("background:#fff;color:#007bff"));
-  html += F("'>EN</a>");
-  html += F("</div></div>");
+  html += getCommonHeader(appCfg.ui_lang == 0 ? F("Configurare Inițială") : F("Initial Setup"), F("/"));
 
   html += F("<h2>"); html += (appCfg.ui_lang == 0 ? F("Conectare WiFi și MQTT") : F("Connect to WiFi and MQTT")); html += F("</h2>");
   html += F("<form method='post' action='/setup_save'>");
@@ -912,7 +870,7 @@ void pageSetup() {
     for (int i = 0; i < wifiCount; i++) {
       String ssid_val = WiFi.SSID(i);
       if (ssid_val.length() == 0) continue;
-      html += F("<option value='"); html += htmlEscape(ssid_val); html += F("'>");
+      html += F("<option value='"); html += DeviceHardware::htmlEscape(ssid_val); html += F("'>");
     }
     html += F("</datalist>");
     html += F("<small style='color:#666'>"); html += (appCfg.ui_lang == 0 ? F("Rețele detectate: ") : F("Networks detected: ")); html += wifiCount; html += F("</small>");
@@ -931,7 +889,7 @@ void pageSetup() {
   html += F("<input type='number' name='port' value='1883'>");
 
   html += F("<label>"); html += (appCfg.ui_lang == 0 ? F("Topic Principal MQTT:") : F("MQTT Topic Base:")); html += F("</label>");
-  html += F("<input type='text' name='topic' value='esp/device'>");
+  html += F("<input type='text' name='topic' value='"); html += defaultHost; html += F("'>");
 
   html += F("<label>"); html += (appCfg.ui_lang == 0 ? F("Activează MQTT:") : F("Enable MQTT:")); html += F("</label>");
   html += F("<select name='enabled'><option value='0'>No</option><option value='1' selected>Yes</option></select>");
@@ -956,6 +914,7 @@ void handleSaveConnection() {
   if (server.hasArg("host")) strlcpy(mqttCfg.host, server.arg("host").c_str(), sizeof(mqttCfg.host));
   if (server.hasArg("port")) mqttCfg.port = (uint16_t)server.arg("port").toInt();
   if (server.hasArg("user")) strlcpy(mqttCfg.user, server.arg("user").c_str(), sizeof(mqttCfg.user));
+  if (server.hasArg("client_id")) strlcpy(mqttCfg.client_id, server.arg("client_id").c_str(), sizeof(mqttCfg.client_id));
   if (server.hasArg("mqtpass")) strlcpy(mqttCfg.pass, server.arg("mqtpass").c_str(), sizeof(mqttCfg.pass));
   if (server.hasArg("topic")) strlcpy(mqttCfg.topic, server.arg("topic").c_str(), sizeof(mqttCfg.topic));
   if (server.hasArg("enabled")) mqttCfg.enabled = (server.arg("enabled") == "1");
@@ -1041,16 +1000,51 @@ void handleSaveMqttControl() {
 void handleTestMqtt() {
   if (!checkConfigAccess()) return;
   
-  String response = F("{\"enabled\":"); 
-  response += (mqttCfg.enabled ? F("true") : F("false"));
-  response += F(",\"connected\":"); 
-  response += (mqtt.connected() ? F("true") : F("false"));
-  response += F(",\"host\":\""); 
-  response += htmlEscape(mqttCfg.host); 
-  response += F("\",\"port\":"); 
-  response += mqttCfg.port; 
-  response += F("}");
+  // Verificăm dacă suntem conectați la WiFi, altfel testul va eșua garantat
+  if (WiFi.status() != WL_CONNECTED) {
+    server.send(200, "application/json", "{\"connected\":false,\"host\":\"WiFi Not Connected\"}");
+    return;
+  }
+
+  String tHost = server.arg("host");
+  uint16_t tPort = (uint16_t)server.arg("port").toInt();
+  if (tPort == 0) tPort = 1883;
+  String tUser = server.arg("user");
+  String tPass = server.arg("mqtpass");
+
+  if (tHost.length() == 0) {
+    server.send(200, "application/json", "{\"connected\":false,\"error\":\"No host\"}");
+    return;
+  }
+
+  // Folosim instante locale pentru a nu afecta conexiunea curenta
+  WiFiClient testClient;
+  PubSubClient testMqtt(testClient);
   
+  // Scurtam timeout-ul pentru a returna eroarea rapid si a nu bloca WDT
+  testClient.setTimeout(3000); 
+  testMqtt.setServer(tHost.c_str(), tPort);
+
+  // Generam un ID unic pentru test ca sa nu intram in conflict cu sesiunea activa
+  String testId = "Test-" + String(ESP.getChipId(), HEX);
+
+  bool success = false;
+  if (tUser.length() > 0) {
+    success = testMqtt.connect(testId.c_str(), tUser.c_str(), tPass.c_str());
+  } else {
+    success = testMqtt.connect(testId.c_str());
+  }
+
+  int mState = testMqtt.state();
+  if (success) testMqtt.disconnect();
+
+  StaticJsonDocument<128> doc;
+  doc["connected"] = success;
+  doc["host"] = tHost;
+  if (!success) doc["state"] = mState;
+
+  String response;
+  serializeJson(doc, response);
   server.send(200, "application/json", response);
 }
 
@@ -1113,27 +1107,20 @@ void handleUpdatePage() {
   html.reserve(4200);
   html += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<title>"); html += (appCfg.ui_lang == 0 ? F("Actualizare") : F("Update")); html += F("</title>");
-  html += F("<style>");
-  html += F("body{font-family:sans-serif;margin:0;padding:20px;background:#f4f7f9;display:flex;justify-content:center;align-items:center;min-height:100vh}");
-  html += F(".card{background:#fff;padding:30px;border-radius:12px;box-shadow:0 8px 16px rgba(0,0,0,0.1);width:100%;max-width:400px;box-sizing:border-box;text-align:center}");
-  html += F("h2{margin:0 0 10px 0;color:#2c3e50;font-size:1.5rem}");
-  html += F("p{color:#7f8c8d;font-size:14px;margin-bottom:25px}");
-  html += F(".file-area{position:relative;margin-bottom:25px}");
-  html += F(".file-area input[type=file]{position:absolute;width:100%;height:100%;opacity:0;cursor:pointer;left:0;top:0}");
-  html += F(".file-dummy{padding:15px;background:#f8f9fa;border:2px dashed #cbd5e0;border-radius:8px;font-size:14px;color:#718096;transition:all .2s}");
-  html += F(".file-area:hover .file-dummy{background:#edf2f7;border-color:#a0aec0}");
-  html += F("button{width:100%;padding:12px;background:#3182ce;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;font-size:15px;transition:background .2s}");
-  html += F("button:hover{background:#2b6cb0}");
-  html += F(".back{display:block;margin-top:20px;text-align:center;color:#a0aec0;text-decoration:none;font-size:14px}");
-  html += F(".back:hover{color:#718096;text-decoration:underline}");
-  html += F(".prg-c{display:none;margin-top:10px}");
-  html += F(".p-bar-bg{background:#edf2f7;border-radius:8px;height:14px;overflow:hidden;margin-bottom:10px}");
-  html += F(".p-bar{background:#3182ce;height:100%;width:0%;transition:width .3s}");
-  html += F("</style></head><body>");
+  html += getCommonCss();
+  html += F("<style>.file-area{position:relative;margin-bottom:25px}.file-area input[type=file]{position:absolute;width:100%;height:100%;opacity:0;cursor:pointer;left:0;top:0}.file-dummy{padding:15px;background:#f8f9fa;border:2px dashed #cbd5e0;border-radius:8px;font-size:14px;color:#718096;transition:all .2s}.file-area:hover .file-dummy{background:#edf2f7;border-color:#a0aec0}.prg-c{display:none;margin-top:10px}.p-bar-bg{background:#edf2f7;border-radius:8px;height:14px;overflow:hidden;margin-bottom:10px}.p-bar{background:#007bff;height:100%;width:0%;transition:width .3s}</style>");
+  html += F("</head><body>");
+
+  html += getCommonHeader(appCfg.ui_lang == 0 ? F("Actualizare Firmware") : F("Firmware Update"), F("/update"));
+  html += getCommonNav();
+
   html += F("<div class='card'>");
-  html += F("<h2>"); html += (appCfg.ui_lang == 0 ? F("Actualizare Firmware") : F("Firmware Update")); html += F("</h2>");
   html += F("<p id='msg' style='margin-bottom:10px'>"); html += (appCfg.ui_lang == 0 ? F("Selectați fișierul .bin.") : F("Select the .bin file.")); html += F("</p>");
   
+  html += F("<div style='margin-bottom:15px; font-size:13px; color:#4a5568'>");
+  html += F("<b>Version:</b> "); html += FW_VERSION; html += F(" | <b>Chip ID:</b> "); html += String(ESP.getChipId(), HEX);
+  html += F("</div>");
+
   // Informații spațiu disponibil
   html += F("<div style='background:#fff5f5;border:1px solid #feb2b2;padding:10px;border-radius:6px;margin-bottom:20px;font-size:13px;color:#c53030'>");
   html += (appCfg.ui_lang == 0 ? F("<b>Spațiu disponibil:</b> ") : F("<b>Available space:</b> "));
@@ -1149,7 +1136,7 @@ void handleUpdatePage() {
   html += (appCfg.ui_lang == 0 ? F("Verifică și Încarcă") : F("Verify and Upload"));
   html += F("</button></form>");
   html += F("<div id='pc' class='prg-c'><div class='p-bar-bg'><div id='pb' class='p-bar'></div></div><p id='pt' style='font-weight:600;color:#2d3748'>0%</p></div>");
-  html += F("<a href='/config' id='bk' class='back'>&larr; "); html += (appCfg.ui_lang == 0 ? F("Înapoi la Configurări") : F("Back to Settings")); html += F("</a>");
+  html += F("<a href='/config' id='bk' style='display:block;margin-top:20px;text-align:center;color:#007bff;text-decoration:none'>&larr; "); html += (appCfg.ui_lang == 0 ? F("Înapoi la Configurări") : F("Back to Settings")); html += F("</a>");
   html += F("<script>");
   html += F("var maxS="); html += maxS; html += F(";var lang="); html += appCfg.ui_lang; html += F(";");
   html += F("function upload(f){var file=f.update.files[0];if(!file)return;");
@@ -1217,6 +1204,7 @@ void setupRoutesNormal() {
   server.on("/save_security", handleSaveSecurity);
   server.on("/api/test_mqtt", handleTestMqtt);
   server.on("/reset", HTTP_POST, handleReset);
+  server.on("/factory_reset", handleFactoryReset);
 
   server.on("/update", HTTP_GET, handleUpdatePage);
   server.on("/update", HTTP_POST, handleUpdateFinish, handleUpdateUpload);
@@ -1231,6 +1219,7 @@ void setupRoutesNormal() {
 
 void setupRoutesSetup() {
   server.on("/", pageSetup);
+  server.on("/save_lang", handleSaveLang);
   server.on("/setup_save", HTTP_POST, []() {
     if (server.hasArg("ssid")) strlcpy(wifiCfg.ssid, server.arg("ssid").c_str(), sizeof(wifiCfg.ssid));
     if (server.hasArg("pass")) strlcpy(wifiCfg.pass, server.arg("pass").c_str(), sizeof(wifiCfg.pass));
@@ -1251,6 +1240,52 @@ void setupRoutesSetup() {
   server.onNotFound([]() {
     sendRedirect("/");
   });
+}
+
+void handlePowerCycleReset() {
+  uint8_t count = 0;
+  if (LittleFS.exists("/pwr_cyc.bin")) {
+    File f = LittleFS.open("/pwr_cyc.bin", "r");
+    if (f) {
+      f.read(&count, 1);
+      f.close();
+    }
+  }
+
+  count++;
+
+  if (count >= 5) {
+    LittleFS.remove("/pwr_cyc.bin");
+    LittleFS.remove("/wifi.bin");
+    LittleFS.remove("/mqtt.bin");
+    LittleFS.remove("/app.bin");
+    LittleFS.remove("/hwcfg.bin");
+    ESP.restart();
+  } else {
+    File f = LittleFS.open("/pwr_cyc.bin", "w");
+    if (f) {
+      f.write(&count, 1);
+      f.close();
+    }
+  }
+}
+
+void handleFactoryReset() {
+  if (!checkConfigAccess()) return;
+  
+  String h = F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>");
+  h += F("body{font-family:sans-serif;background:#f4f7f9;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}");
+  h += F(".card{background:#fff;padding:30px;border-radius:12px;box-shadow:0 8px 16px rgba(0,0,0,0.1);text-align:center;max-width:400px}");
+  h += F("h2{color:#dc3545}p{color:#666;line-height:1.5}b{color:#333}</style></head><body><div class='card'><h2>");
+  h += (appCfg.ui_lang == 0 ? F("Resetare Finalizată") : F("Reset Complete"));
+  h += F("</h2><p>");
+  h += (appCfg.ui_lang == 0 ? F("Dispozitivul a fost resetat la valorile din fabrică.<br>Conectați-vă la WiFi: <b>") : F("Device has been reset to factory defaults.<br>Please connect to WiFi: <b>"));
+  h += hw.getSetupSsid();
+  h += F("</b> pentru configurare.</p></div></body></html>");
+
+  server.send(200, "text/html", h);
+  delay(1000);
+  requestFactoryReset = true; // Setăm flag-ul pentru loop()
 }
 
 // ================= SETUP & LOOP =================
@@ -1280,7 +1315,7 @@ void startNormalMode() {
 
   mqtt.setServer(mqttCfg.host, mqttCfg.port);
   mqtt.setCallback(mqttCallback);
-  mqtt.setBufferSize(768);
+  mqtt.setBufferSize(1024);
 }
 
 bool connectWiFiStation() {
@@ -1320,6 +1355,8 @@ void setup() {
   hw.syncHardwareFromConfig(appCfg);
   hw.applyBootState(appCfg);
 
+  handlePowerCycleReset();
+
   if (connectWiFiStation()) {
     startNormalMode();
   } else {
@@ -1342,6 +1379,11 @@ void loop() {
       wsBroadcastUpdate(); // Actualizare live în loc de refresh pagină
     }
 
+    if (!pwrCycCleared && millis() > 3000) {
+      if (LittleFS.exists("/pwr_cyc.bin")) LittleFS.remove("/pwr_cyc.bin");
+      pwrCycCleared = true;
+    }
+
     // UI live refresh (status cards + sensors)
     if (millis() - lastUiRealtimePush >= 2000UL) {
       lastUiRealtimePush = millis();
@@ -1360,9 +1402,11 @@ void loop() {
 
   hw.loop();
   
-  bool requestFactoryReset = false;
+    bool hwResetRequested = false;
     bool hwStateChanged = false;
-    hw.processRuntimeEvents(appCfg, WiFi.status(), requestFactoryReset, hwStateChanged);
+    hw.processRuntimeEvents(appCfg, WiFi.status(), hwResetRequested, hwStateChanged);
+    if (hwResetRequested) requestFactoryReset = true;
+
     if (hwStateChanged) {
       if (!setupMode && mqttCfg.enabled && mqtt.connected()) {
         hw.publishAllState(mqtt, mqttCfg, appCfg);
@@ -1376,8 +1420,8 @@ void loop() {
     LittleFS.remove("/wifi.bin");
     LittleFS.remove("/mqtt.bin");
     LittleFS.remove("/app.bin");
-    server.send(200, "text/plain", "Factory reset. Rebooting...");
-    delay(300);
+    LittleFS.remove("/hwcfg.bin");
+    delay(500);
     ESP.restart();
     return;
   }

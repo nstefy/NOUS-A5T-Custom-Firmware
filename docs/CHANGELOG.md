@@ -1,5 +1,13 @@
 # Changelog - NOUS A5T Custom Firmware
 
+## [3.0.1] - 2024-04-20
+
+### User-Facing Improvements
+- **MQTT Connection Verification**: You can now verify if the MQTT broker details are correct before saving them. The test button uses the data currently entered in the form fields in real-time.
+- **Improved Visibility**: Fixed the button control text. When a socket is turned ON, the text is now bright white on a green background, making it much easier to read than the previous grey text.
+- **Activity Indicator**: The MQTT test button now displays a "Testing..." message while verifying the connection, letting you know the process is in progress.
+- **Increased Stability**: Optimized web interface communication to prevent accidental reboots when testing invalid or unreachable network settings.
+
 ## [3.0.0] - 2024-04-18
 
 ### Refactored
