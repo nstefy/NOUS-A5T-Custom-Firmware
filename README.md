@@ -2,7 +2,7 @@
 
 Professional-grade custom firmware for the **NOUS A5T Smart Power Strip** (based on the ESP8285 chip). This firmware replaces the stock software to provide enhanced privacy, local control via Web UI/MQTT, and highly accurate energy monitoring.
 
-![Status](images/1.status.png) ![Config](images/2.config.png) ![Security](images/3.security.png) ![OTA](images/4.OTA.png)
+<img src="images/1.status.png" width="24%" /> <img src="images/2.config.png" width="24%" /> <img src="images/3.security.png" width="24%" /> <img src="images/4.OTA.png" width="24%" />
 
 ## Key Features
 
